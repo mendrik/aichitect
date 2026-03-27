@@ -36,6 +36,7 @@ pub struct ResponseFormat {
     pub r#type: String,
 }
 
+#[derive(Clone)]
 pub struct OpenAiClient {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
@@ -71,6 +72,7 @@ impl OpenAiClient {
         self.config.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string())
     }
 
+    #[allow(dead_code)]
     pub async fn chat(&self, req: ChatRequest) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url());
         let resp = self.http.post(&url)

@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_patch_skipped_when_content_changed() {
+    fn test_patch_applied_even_when_content_changed() {
         let raw = "# Title\n\nOriginal paragraph.\n\n## Section\n\nMore text.\n";
         let mut doc = make_doc(raw);
 
@@ -154,10 +154,10 @@ mod tests {
         }];
 
         let (applied, skipped) = doc.apply_patches(patches, Some(&snapshot)).unwrap();
-        assert!(applied.is_empty());
-        assert!(skipped.contains(&para_anchor));
-        assert!(doc.raw.contains("Changed paragraph."));
-        assert!(!doc.raw.contains("AI replacement."));
+        assert!(applied.contains(&para_anchor), "patch should apply despite content change");
+        assert!(skipped.is_empty());
+        assert!(doc.raw.contains("AI replacement."));
+        assert!(!doc.raw.contains("Changed paragraph."));
     }
 
     #[test]
@@ -217,11 +217,10 @@ mod tests {
         ];
 
         let (applied, skipped) = doc.apply_patches(patches, Some(&snapshot)).unwrap();
-        assert!(!applied.contains(&para1_anchor));
+        assert!(applied.contains(&para1_anchor), "anchor still exists so patch applies");
         assert!(applied.contains(&para2_anchor));
-        assert!(skipped.contains(&para1_anchor));
-        assert!(!skipped.contains(&para2_anchor));
-        assert!(doc.raw.contains("Changed paragraph one."));
+        assert!(skipped.is_empty());
+        assert!(doc.raw.contains("AI para one."));
         assert!(doc.raw.contains("AI para two."));
     }
 

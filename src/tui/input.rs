@@ -52,6 +52,12 @@ impl InputBuffer {
         self.paste_regions.clear();
     }
 
+    pub fn set_text(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.text.chars().count();
+        self.paste_regions.clear();
+    }
+
     // ── Editing ───────────────────────────────────────────────────────────────
 
     pub fn insert_char(&mut self, c: char) {

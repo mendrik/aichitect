@@ -2,6 +2,7 @@ use crate::document::Document;
 use crate::remarks::Remark;
 use crate::openai::client::{ChatMessage, ChatRequest, ResponseFormat};
 use crate::config::Config;
+use crate::revision_context::{build_targeted_revision_plan, RevisionRequestMode, TargetedRevisionPlan};
 
 const REVISION_SYSTEM_PROMPT: &str = r#"You are Aichitect, an expert technical writer and document architect. Your job is to revise specific sections of a technical document based on user remarks.
 
@@ -61,7 +62,54 @@ Response format:
 }
 "#;
 
+const TARGETED_REVISION_SYSTEM_PROMPT: &str = r#"You are Aichitect, an expert technical writer and document architect. Your job is to revise a document using only the targeted context packs provided.
+
+You are NOT receiving the full document. You will receive:
+1. A limited anchor map for the relevant anchors only
+2. One or more targeted revision context packs
+3. Explicit related occurrence targets when the same change should be applied consistently
+
+You MUST:
+- Only produce patches for anchors explicitly included in the request
+- Use the local context packs to preserve terminology and structure
+- Apply the same change consistently to explicit occurrence targets when the instruction implies global replacement/removal
+- Avoid inventing edits to anchors that were not provided
+
+You MUST respond with a JSON object containing a "patches" array. Each patch must have:
+- "op": one of "replace_section", "replace_text_span", "replace_code_block", "insert_after", "insert_before", "delete_block", "update_heading_text", "update_list_item"
+- "anchor": one of the provided target anchors
+- "rationale": brief explanation of the change
+
+For replace/insert ops, include "content" with the new markdown text.
+For replace_code_block, include "content" (code only, no fences) and optionally "lang".
+For update_heading_text / update_list_item, include "new_text".
+
+Respond with valid JSON only."#;
+
+pub struct PreparedRevisionRequest {
+    pub request: ChatRequest,
+    pub mode: RevisionRequestMode,
+}
+
 pub fn build_revision_request(
+    config: &Config,
+    doc: &Document,
+    remarks: &[&Remark],
+) -> PreparedRevisionRequest {
+    if let Some(plan) = build_targeted_revision_plan(doc, remarks) {
+        return PreparedRevisionRequest {
+            request: build_targeted_revision_request(config, &plan),
+            mode: RevisionRequestMode::Targeted,
+        };
+    }
+
+    PreparedRevisionRequest {
+        request: build_full_revision_request(config, doc, remarks),
+        mode: RevisionRequestMode::FullDocument,
+    }
+}
+
+fn build_full_revision_request(
     config: &Config,
     doc: &Document,
     remarks: &[&Remark],
@@ -115,10 +163,115 @@ pub fn build_revision_request(
     user_msg.push_str("\nPlease provide patches to address all remarks. Respond with valid JSON only.");
 
     ChatRequest {
-        model: config.model.clone(),
+        model: config.model_fix.clone(),
         messages: vec![
             ChatMessage { role: "system".to_string(), content: system },
             ChatMessage { role: "user".to_string(), content: user_msg },
+        ],
+        temperature: config.temperature,
+        max_tokens: config.max_tokens,
+        stream: false,
+        response_format: Some(ResponseFormat { r#type: "json_object".to_string() }),
+    }
+}
+
+fn build_targeted_revision_request(
+    config: &Config,
+    plan: &TargetedRevisionPlan,
+) -> ChatRequest {
+    let mut relevant_anchors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for pack in &plan.packs {
+        if seen.insert(pack.primary_target.anchor.clone()) {
+            relevant_anchors.push(format!(
+                "{}: primary target",
+                pack.primary_target.anchor
+            ));
+        }
+        for target in &pack.occurrence_targets {
+            if seen.insert(target.anchor.clone()) {
+                relevant_anchors.push(format!("{}: related occurrence", target.anchor));
+            }
+        }
+        for node in &pack.local_context_nodes {
+            if seen.insert(node.anchor.clone()) {
+                relevant_anchors.push(format!("{}: {}", node.anchor, node.summary));
+            }
+        }
+    }
+
+    let mut user_msg = format!(
+        "## Relevant Anchors\n\n{}\n\n## Targeted Revision Context Packs\n\n",
+        relevant_anchors.join("\n")
+    );
+
+    for (idx, pack) in plan.packs.iter().enumerate() {
+        user_msg.push_str(&format!(
+            "### Context Pack {}\n\
+             Generation: {}\n\
+             Primary anchor: `{}`\n\
+             Instruction: {}\n\
+             Selected text: {}\n\
+             Primary target markdown:\n```markdown\n{}\n```\n\n",
+            idx + 1,
+            pack.generation,
+            pack.primary_target.anchor,
+            pack.instruction,
+            pack.primary_target.selected_text,
+            pack.primary_target.raw_markdown
+        ));
+
+        if let Some(list_context) = &pack.list_context {
+            user_msg.push_str(&format!(
+                "List context:\n```markdown\n{}\n```\n\n",
+                list_context
+            ));
+        }
+
+        if !pack.local_context_nodes.is_empty() {
+            user_msg.push_str("Local context nodes:\n");
+            for node in &pack.local_context_nodes {
+                user_msg.push_str(&format!(
+                    "- `{}` ({})\n```markdown\n{}\n```\n",
+                    node.anchor,
+                    node.summary,
+                    node.raw_markdown
+                ));
+            }
+            user_msg.push('\n');
+        }
+
+        if !pack.occurrence_targets.is_empty() {
+            user_msg.push_str("Explicit related occurrence targets:\n");
+            for target in &pack.occurrence_targets {
+                user_msg.push_str(&format!(
+                    "- `{}` ({})\n  Selected text: {}\n```markdown\n{}\n```\n",
+                    target.anchor,
+                    target.role,
+                    target.selected_text,
+                    target.raw_markdown
+                ));
+            }
+            user_msg.push('\n');
+        }
+    }
+
+    user_msg.push_str(
+        "Please provide patches to address all instructions using only the provided anchors and context. Respond with valid JSON only.",
+    );
+
+    ChatRequest {
+        model: config.model_fix.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: TARGETED_REVISION_SYSTEM_PROMPT.to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: user_msg,
+            },
         ],
         temperature: config.temperature,
         max_tokens: config.max_tokens,
@@ -161,7 +314,7 @@ Return ONLY the raw markdown content. No preamble, no explanation, no JSON wrapp
 
 pub fn build_creation_request(config: &Config, prompt: &str) -> ChatRequest {
     ChatRequest {
-        model: config.model.clone(),
+        model: config.model_fix.clone(),
         messages: vec![
             ChatMessage { role: "system".to_string(), content: CREATION_SYSTEM_PROMPT.to_string() },
             ChatMessage { role: "user".to_string(), content: prompt.to_string() },

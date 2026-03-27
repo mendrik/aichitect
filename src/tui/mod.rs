@@ -34,6 +34,7 @@ pub async fn run(config: Config, doc: Document) -> Result<()> {
 
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
+        app.spinner_tick = app.spinner_tick.wrapping_add(1);
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {

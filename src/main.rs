@@ -7,6 +7,7 @@ mod document;
 mod history;
 mod openai;
 mod remarks;
+mod revision_context;
 mod review;
 mod tui;
 

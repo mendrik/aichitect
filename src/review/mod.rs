@@ -79,6 +79,7 @@ pub struct ReviewStore {
 impl ReviewStore {
     pub fn new() -> Self { Self::default() }
     pub fn add(&mut self, item: ReviewItem) { self.items.push(item); }
+    pub fn is_empty(&self) -> bool { self.items.is_empty() }
     pub fn pending(&self) -> Vec<&ReviewItem> {
         self.items.iter().filter(|i| i.status == ReviewStatus::New || i.status == ReviewStatus::Answered).collect()
     }
@@ -98,5 +99,8 @@ impl ReviewStore {
         for item in self.items.iter_mut() {
             if ids.contains(&item.id) { item.status = ReviewStatus::Sent; }
         }
+    }
+    pub fn clear(&mut self) {
+        self.items.clear();
     }
 }

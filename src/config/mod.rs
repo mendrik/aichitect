@@ -21,6 +21,7 @@ impl Default for ColorMode {
 struct RawConfig {
     pub api_key: String,
     pub model: Option<String>,
+    pub model_fix: Option<String>,
     pub base_url: Option<String>,
     pub organization: Option<String>,
     pub project: Option<String>,
@@ -44,6 +45,7 @@ struct RawConfig {
 pub struct Config {
     pub api_key: String,
     pub model: String,
+    pub model_fix: String,
     pub base_url: Option<String>,
     pub organization: Option<String>,
     pub project: Option<String>,
@@ -88,6 +90,7 @@ impl Config {
         Ok(Config {
             api_key: raw.api_key,
             model: raw.model.unwrap_or_else(|| "gpt-4o".to_string()),
+            model_fix: raw.model_fix.unwrap_or_else(|| "gpt-4o".to_string()),
             base_url: raw.base_url,
             organization: raw.organization,
             project: raw.project,
@@ -114,6 +117,7 @@ impl Config {
 
 api_key = "sk-..."
 model = "gpt-4o"
+model_fix = "gpt-4o-mini"
 
 # Optional — uncomment to override OpenAI defaults:
 # temperature = 0.3

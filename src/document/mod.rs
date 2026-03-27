@@ -5,10 +5,30 @@ pub use patch::PatchOp;
 use anyhow::Result;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::path::PathBuf;
 use std::fs;
 
 pub type AnchorId = String;
+
+pub fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockFingerprint {
+    pub hash: u64,
+    pub raw: String,
+}
+
+impl BlockFingerprint {
+    pub fn from_raw(raw: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        raw.hash(&mut hasher);
+        BlockFingerprint { hash: hasher.finish(), raw: raw.to_string() }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -295,14 +315,25 @@ impl Document {
         }
     }
 
-    pub fn content_snapshot(&self) -> HashMap<AnchorId, String> {
+    pub fn content_snapshot(&self) -> HashMap<AnchorId, BlockFingerprint> {
         self.nodes
             .iter()
             .map(|n| {
-                (
-                    n.anchor.clone(),
-                    self.raw[n.source_start..n.source_end].to_string(),
-                )
+                let raw = &self.raw[n.source_start..n.source_end];
+                (n.anchor.clone(), BlockFingerprint::from_raw(raw))
+            })
+            .collect()
+    }
+
+    /// Build a map from fingerprint hash to node index for fast lookup.
+    fn fingerprint_index(&self) -> HashMap<u64, usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let raw = &self.raw[n.source_start..n.source_end];
+                let fp = BlockFingerprint::from_raw(raw);
+                (fp.hash, i)
             })
             .collect()
     }
@@ -310,7 +341,7 @@ impl Document {
     pub fn apply_patches(
         &mut self,
         patches: Vec<PatchOp>,
-        expected_content: Option<&HashMap<AnchorId, String>>,
+        expected_content: Option<&HashMap<AnchorId, BlockFingerprint>>,
     ) -> Result<(Vec<String>, Vec<String>)> {
         self.push_undo();
 
@@ -318,20 +349,27 @@ impl Document {
         let mut skipped = Vec::new();
         let mut ops_with_pos: Vec<(usize, usize, PatchOp)> = Vec::new();
 
+        let fp_index = expected_content.map(|_| self.fingerprint_index());
+
         for patch in patches {
             let anchor = patch.anchor().to_string();
-            if let Some(&idx) = self.anchor_map.get(&anchor) {
+
+            let node_pos: Option<(usize, usize)> = if let Some(&idx) = self.anchor_map.get(&anchor) {
                 let node = &self.nodes[idx];
-                if let Some(snapshot) = expected_content {
-                    let current = &self.raw[node.source_start..node.source_end];
-                    if let Some(expected) = snapshot.get(&anchor) {
-                        if current != expected {
-                            skipped.push(anchor);
-                            continue;
-                        }
-                    }
-                }
-                ops_with_pos.push((node.source_start, node.source_end, patch));
+                Some((node.source_start, node.source_end))
+            } else if let Some(snapshot) = expected_content {
+                // Anchor gone — try to locate the original block by fingerprint
+                snapshot.get(&anchor).and_then(|fp| {
+                    fp_index.as_ref()
+                        .and_then(|idx_map| idx_map.get(&fp.hash))
+                        .map(|&ni| (self.nodes[ni].source_start, self.nodes[ni].source_end))
+                })
+            } else {
+                None
+            };
+
+            if let Some((start, end)) = node_pos {
+                ops_with_pos.push((start, end, patch));
             } else {
                 skipped.push(anchor);
             }
@@ -555,11 +593,11 @@ impl Document {
     pub fn anchor_map_display(&self) -> String {
         self.nodes.iter()
             .map(|n| format!("{}: {:?}", n.anchor, match &n.kind {
-                NodeKind::Heading { text, .. } => format!("Heading({})", &text[..text.len().min(40)]),
-                NodeKind::Paragraph { text } => format!("Paragraph({})", &text[..text.len().min(40)]),
+                NodeKind::Heading { text, .. } => format!("Heading({})", truncate_chars(text, 40)),
+                NodeKind::Paragraph { text } => format!("Paragraph({})", truncate_chars(text, 40)),
                 NodeKind::CodeBlock { lang, .. } => format!("CodeBlock({:?})", lang),
-                NodeKind::ListItem { text, .. } => format!("ListItem({})", &text[..text.len().min(40)]),
-                NodeKind::BlockQuote { text } => format!("BlockQuote({})", &text[..text.len().min(40)]),
+                NodeKind::ListItem { text, .. } => format!("ListItem({})", truncate_chars(text, 40)),
+                NodeKind::BlockQuote { text } => format!("BlockQuote({})", truncate_chars(text, 40)),
                 NodeKind::HorizontalRule => "HorizontalRule".to_string(),
                 NodeKind::Html { .. } => "Html".to_string(),
             }))
@@ -591,8 +629,8 @@ impl Document {
                 | NodeKind::ListItem { text, .. }
                 | NodeKind::BlockQuote { text } => {
                     if text.to_lowercase().contains(&q) {
-                        let snippet = if text.len() > 80 {
-                            format!("{}…", &text[..80])
+                        let snippet = if text.chars().count() > 80 {
+                            format!("{}…", truncate_chars(text, 80))
                         } else {
                             text.clone()
                         };
@@ -661,6 +699,17 @@ fn unique_anchor(prefix: &str, counters: &mut HashMap<String, usize>) -> String 
     };
     *count += 1;
     anchor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn truncate_chars_respects_unicode_boundaries() {
+        let text = "signals — externally fed";
+        assert_eq!(truncate_chars(text, 10), "signals — ");
+    }
 }
 
 fn word_wrap(text: &str, width: usize) -> Vec<String> {

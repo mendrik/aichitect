@@ -2,7 +2,19 @@
   "permissions": {
     "allow": [
       "Bash(cargo test 2>&1 *)",
-      "Bash(tail *)"
+      "Bash(tail *)",
+      "Bash(cd *)",
+      "Bash(cargo build 2>&1 *)",
+      "Bash(head *)",
+      "Bash(cargo test 2>&1 *)",
+      "Bash(cargo build 2>&1 *)",
+      "Bash(git log *)",
+      "Bash(git diff HEAD *)",
+      "Bash(git show HEAD:src/tui/events.rs *)",
+      "Bash(grep *)",
+      "Bash(cargo test 2>&1 *)",
+      "Bash(cargo build 2>&1 *)",
+      "Bash(cargo test 2>&1 *)"
     ]
   }
 }

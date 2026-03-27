@@ -70,7 +70,14 @@ When you open a file that does not exist yet, Aichitect asks the model to genera
 
 ### 2. Revision from remarks
 
-When you press `S`, Aichitect builds one request containing:
+When you press `S`, Aichitect now prefers a targeted revision request. It builds local context packs containing:
+
+- the target anchor and selected text for each remark
+- nearby section / sibling node context
+- list or code-line context when relevant
+- explicit related occurrences when the same wording appears elsewhere
+
+If the targeted scope grows too large or looks ambiguous, Aichitect falls back to the older full-document request that includes:
 
 - an anchor map for the parsed document
 - the full Markdown document
@@ -115,7 +122,7 @@ If at least one patch applied successfully, Aichitect also writes a snapshot to:
 ~/.aichitect/history/<document-stem>/<timestamp>.md
 ```
 
-That history is what the `H` browser shows, and it gives you an on-disk trail of AI-produced revisions. Applied changes stay in memory until you press `W`, unless `autosave = true` is enabled.
+That history is what the `H` browser shows, and it gives you an on-disk trail of AI-produced revisions. Applied patch changes are now also saved to the working document immediately after they succeed.
 
 ## Review Mode
 

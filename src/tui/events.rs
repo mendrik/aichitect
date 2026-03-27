@@ -3,9 +3,26 @@ use super::app::{App, AppMode};
 use super::input::InputBuffer;
 
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
+    if matches!(key.code, KeyCode::Char('d')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return;
+    }
+
+    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.copy_current_selection();
+        return;
+    }
+
+    if matches!(key.code, KeyCode::Char('e')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.start_direct_edit();
+        return;
+    }
+
     match app.mode {
         AppMode::Normal => handle_normal(app, key).await,
+        AppMode::Search => handle_search_mode(app, key),
         AppMode::CreationPrompt => handle_creation_prompt(app, key).await,
+        AppMode::DirectEdit => handle_input_mode(app, key, InputTarget::DirectEdit).await,
         AppMode::RemarkEdit => handle_input_mode(app, key, InputTarget::Remark).await,
         AppMode::ReviewMode => handle_review_mode(app, key).await,
         AppMode::ReviewAnswer => handle_input_mode(app, key, InputTarget::ReviewAnswer).await,
@@ -49,8 +66,11 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 
 pub fn handle_paste(app: &mut App, text: String) {
     match app.mode {
-        AppMode::RemarkEdit | AppMode::ReviewAnswer | AppMode::CreationPrompt => {
+        AppMode::Search | AppMode::RemarkEdit | AppMode::ReviewAnswer | AppMode::CreationPrompt => {
             app.input.paste(text);
+            if matches!(app.mode, AppMode::Search) {
+                app.update_search();
+            }
         }
         _ => {}
     }
@@ -61,13 +81,13 @@ pub fn handle_paste(app: &mut App, text: String) {
 async fn handle_normal(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true
-        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_search(),
         KeyCode::Char('?') => app.mode = AppMode::Help,
         KeyCode::Up | KeyCode::Char('k') => { app.clear_occurrences(); app.select_prev_node(); }
         KeyCode::Down | KeyCode::Char('j') => { app.clear_occurrences(); app.select_next_node(); }
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.collapse_headings_below(),
         KeyCode::Left => app.collapse_heading(),
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.expand_headings_below(),
         KeyCode::Right => app.expand_heading(),
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
@@ -99,6 +119,21 @@ async fn handle_normal(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_search_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_search(),
+        KeyCode::Enter => {
+            let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
+            app.advance_search(forward);
+        }
+        _ => {
+            if handle_common_input_key(&mut app.input, key) {
+                app.update_search();
+            }
+        }
+    }
+}
+
 // ── Creation-prompt mode ─────────────────────────────────────────────────────
 
 async fn handle_creation_prompt(app: &mut App, key: KeyEvent) {
@@ -120,6 +155,7 @@ async fn handle_creation_prompt(app: &mut App, key: KeyEvent) {
 // ── Remark / review-answer input mode ────────────────────────────────────────
 
 enum InputTarget {
+    DirectEdit,
     Remark,
     ReviewAnswer,
 }
@@ -130,6 +166,7 @@ async fn handle_input_mode(app: &mut App, key: KeyEvent, target: InputTarget) {
     }
     match key.code {
         KeyCode::Enter => match target {
+            InputTarget::DirectEdit => app.submit_direct_edit(),
             InputTarget::Remark => app.submit_remark().await,
             InputTarget::ReviewAnswer => app.submit_review_answer().await,
         },
@@ -149,6 +186,11 @@ async fn handle_review_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.mode = AppMode::Normal;
             app.status_message = Some("Exited review mode.".to_string());
+        }
+        KeyCode::Char('A') => {
+            if app.review_store.is_empty() {
+                app.open_review_panel().await;
+            }
         }
         KeyCode::Char('j') | KeyCode::Down => {
             if pending_len > 0 {
@@ -171,6 +213,7 @@ async fn handle_review_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('a') => app.start_review_answer(),
         KeyCode::Char('y') => app.accept_resolution().await,
         KeyCode::Char('d') => app.dismiss_review(),
+        KeyCode::Char('x') => app.clear_review_results(),
         _ => {}
     }
 }
@@ -181,6 +224,7 @@ async fn handle_review_mode(app: &mut App, key: KeyEvent) {
 
 fn handle_common_input_key(buf: &mut InputBuffer, key: KeyEvent) -> bool {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
 
     match key.code {
         // Alt+Enter → literal newline (multi-line input).
@@ -188,7 +232,14 @@ fn handle_common_input_key(buf: &mut InputBuffer, key: KeyEvent) -> bool {
             buf.insert_newline();
             true
         }
+        KeyCode::Char('h') if control => {
+            buf.backspace();
+            true
+        }
         KeyCode::Char(c) => {
+            if control {
+                return false;
+            }
             buf.insert_char(c);
             true
         }

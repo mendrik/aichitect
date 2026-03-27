@@ -3,6 +3,7 @@
 
 api_key = "sk-..."
 model = "gpt-4o"
+model_fix = "gpt-4o-mini"
 temperature = 0.3
 max_tokens = 4096
 streaming = true
