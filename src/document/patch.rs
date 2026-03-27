@@ -78,7 +78,7 @@ mod tests {
             rationale: "test".to_string(),
         }];
 
-        let applied = doc.apply_patches(patches).unwrap();
+        let (applied, _skipped) = doc.apply_patches(patches, None).unwrap();
         assert!(applied.contains(&para_anchor));
         assert!(doc.raw.contains("replaced paragraph"));
         assert!(!doc.raw.contains("This is a paragraph."));
@@ -100,7 +100,7 @@ mod tests {
             rationale: "test".to_string(),
         }];
 
-        let applied = doc.apply_patches(patches).unwrap();
+        let (applied, _skipped) = doc.apply_patches(patches, None).unwrap();
         assert!(applied.contains(&first_para));
         assert!(doc.raw.contains("Inserted paragraph."));
         let first_pos = doc.raw.find("First paragraph").unwrap();
@@ -129,7 +129,117 @@ mod tests {
             rationale: "test".to_string(),
         }];
 
-        doc.apply_patches(patches).unwrap();
+        doc.apply_patches(patches, None).unwrap();
         assert!(doc.anchor_map.contains_key(&section_anchor));
+    }
+
+    #[test]
+    fn test_stale_patch_skipped_when_content_changed() {
+        let raw = "# Title\n\nOriginal paragraph.\n\n## Section\n\nMore text.\n";
+        let mut doc = make_doc(raw);
+
+        let para_anchor = doc.nodes.iter()
+            .find(|n| matches!(&n.kind, crate::document::NodeKind::Paragraph { text } if text.contains("Original")))
+            .map(|n| n.anchor.clone())
+            .expect("paragraph node");
+
+        let snapshot = doc.content_snapshot();
+
+        doc.set_content("# Title\n\nChanged paragraph.\n\n## Section\n\nMore text.\n".to_string()).unwrap();
+
+        let patches = vec![PatchOp::ReplaceSection {
+            anchor: para_anchor.clone(),
+            content: "AI replacement.\n".to_string(),
+            rationale: "test".to_string(),
+        }];
+
+        let (applied, skipped) = doc.apply_patches(patches, Some(&snapshot)).unwrap();
+        assert!(applied.is_empty());
+        assert!(skipped.contains(&para_anchor));
+        assert!(doc.raw.contains("Changed paragraph."));
+        assert!(!doc.raw.contains("AI replacement."));
+    }
+
+    #[test]
+    fn test_patch_applied_when_content_unchanged() {
+        let raw = "# Title\n\nOriginal paragraph.\n\n## Section\n\nMore text.\n";
+        let mut doc = make_doc(raw);
+
+        let para_anchor = doc.nodes.iter()
+            .find(|n| matches!(&n.kind, crate::document::NodeKind::Paragraph { text } if text.contains("Original")))
+            .map(|n| n.anchor.clone())
+            .expect("paragraph node");
+
+        let snapshot = doc.content_snapshot();
+
+        let patches = vec![PatchOp::ReplaceSection {
+            anchor: para_anchor.clone(),
+            content: "AI replacement.\n".to_string(),
+            rationale: "test".to_string(),
+        }];
+
+        let (applied, skipped) = doc.apply_patches(patches, Some(&snapshot)).unwrap();
+        assert!(applied.contains(&para_anchor));
+        assert!(skipped.is_empty());
+        assert!(doc.raw.contains("AI replacement."));
+    }
+
+    #[test]
+    fn test_partial_apply_mixed_stale_and_fresh() {
+        let raw = "# Title\n\nParagraph one.\n\n## Section\n\nParagraph two.\n";
+        let mut doc = make_doc(raw);
+
+        let para1_anchor = doc.nodes.iter()
+            .find(|n| matches!(&n.kind, crate::document::NodeKind::Paragraph { text } if text.contains("one")))
+            .map(|n| n.anchor.clone())
+            .expect("para one");
+
+        let para2_anchor = doc.nodes.iter()
+            .find(|n| matches!(&n.kind, crate::document::NodeKind::Paragraph { text } if text.contains("two")))
+            .map(|n| n.anchor.clone())
+            .expect("para two");
+
+        let snapshot = doc.content_snapshot();
+
+        doc.set_content("# Title\n\nChanged paragraph one.\n\n## Section\n\nParagraph two.\n".to_string()).unwrap();
+
+        let patches = vec![
+            PatchOp::ReplaceSection {
+                anchor: para1_anchor.clone(),
+                content: "AI para one.\n".to_string(),
+                rationale: "test".to_string(),
+            },
+            PatchOp::ReplaceSection {
+                anchor: para2_anchor.clone(),
+                content: "AI para two.\n".to_string(),
+                rationale: "test".to_string(),
+            },
+        ];
+
+        let (applied, skipped) = doc.apply_patches(patches, Some(&snapshot)).unwrap();
+        assert!(!applied.contains(&para1_anchor));
+        assert!(applied.contains(&para2_anchor));
+        assert!(skipped.contains(&para1_anchor));
+        assert!(!skipped.contains(&para2_anchor));
+        assert!(doc.raw.contains("Changed paragraph one."));
+        assert!(doc.raw.contains("AI para two."));
+    }
+
+    #[test]
+    fn test_missing_anchor_skipped() {
+        let raw = "# Title\n\nParagraph one.\n";
+        let mut doc = make_doc(raw);
+
+        let snapshot = doc.content_snapshot();
+
+        let patches = vec![PatchOp::ReplaceSection {
+            anchor: "nonexistent-anchor".to_string(),
+            content: "Ghost.\n".to_string(),
+            rationale: "test".to_string(),
+        }];
+
+        let (applied, skipped) = doc.apply_patches(patches, Some(&snapshot)).unwrap();
+        assert!(applied.is_empty());
+        assert!(skipped.contains(&"nonexistent-anchor".to_string()));
     }
 }

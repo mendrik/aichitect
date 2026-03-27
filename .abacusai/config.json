@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test 2>&1 *)",
+      "Bash(tail *)"
+    ]
+  }
+}
