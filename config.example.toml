@@ -1,0 +1,21 @@
+# Aichitect Configuration
+# Copy this to ~/.aichitect/config.toml and fill in your API key.
+
+api_key = "sk-..."
+model = "gpt-4o"
+temperature = 0.3
+max_tokens = 4096
+streaming = true
+color_mode = "auto"   # auto | always | never
+autosave = false
+autosave_interval_secs = 30
+
+# Optional: override the base URL (e.g. for Azure OpenAI or local proxies)
+# base_url = "https://api.openai.com/v1"
+
+# Optional: OpenAI organization and project IDs
+# organization = "org-..."
+# project = "proj_..."
+
+# Optional: override the system prompt used for revisions
+# system_prompt_override = "You are a helpful document editor..."

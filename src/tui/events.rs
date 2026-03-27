@@ -1,0 +1,256 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
+use super::app::{App, AppMode};
+use super::input::InputBuffer;
+
+pub async fn handle_key(app: &mut App, key: KeyEvent) {
+    match app.mode {
+        AppMode::Normal => handle_normal(app, key).await,
+        AppMode::CreationPrompt => handle_creation_prompt(app, key).await,
+        AppMode::RemarkEdit => handle_input_mode(app, key, InputTarget::Remark).await,
+        AppMode::ReviewMode => handle_review_mode(app, key).await,
+        AppMode::ReviewAnswer => handle_input_mode(app, key, InputTarget::ReviewAnswer).await,
+        AppMode::HistoryBrowser => handle_history_browser(app, key),
+        AppMode::Help => { app.mode = AppMode::Normal; }
+    }
+}
+
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if in_rect(mouse.column, mouse.row, app.last_side_area) {
+                app.side_scroll_up();
+            } else if in_rect(mouse.column, mouse.row, Some(app.last_doc_area)) {
+                app.scroll_up();
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if in_rect(mouse.column, mouse.row, app.last_side_area) {
+                app.side_scroll_down();
+            } else if in_rect(mouse.column, mouse.row, Some(app.last_doc_area)) {
+                app.scroll_down();
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Click in doc area: select the node at that row.
+            if in_rect(mouse.column, mouse.row, Some(app.last_doc_area)) {
+                let area = app.last_doc_area;
+                let inner_row = mouse.row.saturating_sub(area.y + 1) as usize;
+                let line_idx = app.scroll_offset + inner_row;
+                if let Some(line) = app.display_lines.get(line_idx) {
+                    if let Some(ni) = line.node_index {
+                        app.selected_node = Some(ni);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn handle_paste(app: &mut App, text: String) {
+    match app.mode {
+        AppMode::RemarkEdit | AppMode::ReviewAnswer | AppMode::CreationPrompt => {
+            app.input.paste(text);
+        }
+        _ => {}
+    }
+}
+
+// ── Normal mode ──────────────────────────────────────────────────────────────
+
+async fn handle_normal(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true
+        }
+        KeyCode::Char('?') => app.mode = AppMode::Help,
+        KeyCode::Up | KeyCode::Char('k') => { app.clear_occurrences(); app.select_prev_node(); }
+        KeyCode::Down | KeyCode::Char('j') => { app.clear_occurrences(); app.select_next_node(); }
+        KeyCode::Left => app.collapse_heading(),
+        KeyCode::Right => app.expand_heading(),
+        KeyCode::PageUp => app.page_up(),
+        KeyCode::PageDown => app.page_down(),
+        KeyCode::Char('g') => app.scroll_offset = 0,
+        KeyCode::Char('G') => {
+            app.scroll_offset = app.display_lines.len().saturating_sub(1);
+        }
+        KeyCode::Char('J') => app.scroll_down(),
+        KeyCode::Char('K') => app.scroll_up(),
+        KeyCode::Char(' ') => app.toggle_collapse(),
+        KeyCode::Char('c') => app.toggle_collapse_all(),
+        KeyCode::Char('r') => app.start_remark(),
+        KeyCode::Char('f') => app.find_and_show_occurrences(),
+        KeyCode::Char('R') => {
+            app.show_remarks_panel = !app.show_remarks_panel;
+        }
+        KeyCode::Char('S') => app.send_remarks().await,
+        KeyCode::Char('A') => app.open_review_panel().await,
+        KeyCode::Char('H') => app.open_history(),
+        KeyCode::Char('w') | KeyCode::Char('W') => app.save_doc(),
+        KeyCode::Char('u') => app.undo(),
+        KeyCode::Char('U') => app.redo(),
+        KeyCode::Esc => {
+            app.clear_occurrences();
+            app.selected_node = None;
+            app.status_message = Some("Press ? for help".to_string());
+        }
+        _ => {}
+    }
+}
+
+// ── Creation-prompt mode ─────────────────────────────────────────────────────
+
+async fn handle_creation_prompt(app: &mut App, key: KeyEvent) {
+    if handle_common_input_key(&mut app.input, key) {
+        return;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            // Alt+Enter already handled by handle_common_input_key (newline).
+            app.submit_creation_prompt().await;
+        }
+        KeyCode::Esc => {
+            app.should_quit = true;
+        }
+        _ => {}
+    }
+}
+
+// ── Remark / review-answer input mode ────────────────────────────────────────
+
+enum InputTarget {
+    Remark,
+    ReviewAnswer,
+}
+
+async fn handle_input_mode(app: &mut App, key: KeyEvent, target: InputTarget) {
+    if handle_common_input_key(&mut app.input, key) {
+        return;
+    }
+    match key.code {
+        KeyCode::Enter => match target {
+            InputTarget::Remark => app.submit_remark().await,
+            InputTarget::ReviewAnswer => app.submit_review_answer().await,
+        },
+        KeyCode::Esc => {
+            app.clear_occurrences();
+            app.cancel_input();
+        }
+        _ => {}
+    }
+}
+
+// ── Review-mode navigation ────────────────────────────────────────────────────
+
+async fn handle_review_mode(app: &mut App, key: KeyEvent) {
+    let pending_len = app.review_store.pending().len();
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.status_message = Some("Exited review mode.".to_string());
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if pending_len > 0 {
+                app.selected_review = Some(
+                    app.selected_review
+                        .map(|i| (i + 1).min(pending_len - 1))
+                        .unwrap_or(0),
+                );
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if pending_len > 0 {
+                app.selected_review = Some(
+                    app.selected_review
+                        .map(|i| i.saturating_sub(1))
+                        .unwrap_or(0),
+                );
+            }
+        }
+        KeyCode::Char('a') => app.start_review_answer(),
+        KeyCode::Char('y') => app.accept_resolution().await,
+        KeyCode::Char('d') => app.dismiss_review(),
+        _ => {}
+    }
+}
+
+// ── Shared single-line / multi-line input key handler ────────────────────────
+//
+// Returns `true` if the key was consumed (so the caller skips its own match).
+
+fn handle_common_input_key(buf: &mut InputBuffer, key: KeyEvent) -> bool {
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        // Alt+Enter → literal newline (multi-line input).
+        KeyCode::Enter if alt => {
+            buf.insert_newline();
+            true
+        }
+        KeyCode::Char(c) => {
+            buf.insert_char(c);
+            true
+        }
+        KeyCode::Backspace => {
+            buf.backspace();
+            true
+        }
+        KeyCode::Left => {
+            buf.move_left();
+            true
+        }
+        KeyCode::Right => {
+            buf.move_right();
+            true
+        }
+        KeyCode::Up => {
+            buf.move_up();
+            true
+        }
+        KeyCode::Down => {
+            buf.move_down();
+            true
+        }
+        KeyCode::Home => {
+            buf.move_home();
+            true
+        }
+        KeyCode::End => {
+            buf.move_end();
+            true
+        }
+        _ => false,
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn in_rect(col: u16, row: u16, rect: Option<ratatui::layout::Rect>) -> bool {
+    if let Some(r) = rect {
+        col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+    } else {
+        false
+    }
+}
+
+// ── History browser ───────────────────────────────────────────────────────────
+
+fn handle_history_browser(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.status_message = Some("History closed.".to_string());
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.history_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.history_prev(),
+        KeyCode::PageDown => {
+            app.history_scroll = app.history_scroll.saturating_add(10);
+        }
+        KeyCode::PageUp => {
+            app.history_scroll = app.history_scroll.saturating_sub(10);
+        }
+        KeyCode::Enter => app.restore_history(),
+        _ => {}
+    }
+}
