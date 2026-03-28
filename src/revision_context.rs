@@ -210,6 +210,7 @@ fn summarize_node(node: &crate::document::DocNode) -> String {
         NodeKind::BlockQuote { text } => format!("BlockQuote({})", text),
         NodeKind::HorizontalRule => "HorizontalRule".to_string(),
         NodeKind::Html { .. } => "Html".to_string(),
+        NodeKind::Table { headers, rows } => format!("Table({}col×{}row)", headers.len(), rows.len()),
     }
 }
 

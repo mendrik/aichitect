@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 pub mod patch;
+pub mod highlight;
 pub use patch::PatchOp;
 
 use anyhow::Result;
@@ -54,10 +55,11 @@ pub enum NodeKind {
     Heading { level: u8, text: String },
     Paragraph { text: String },
     CodeBlock { lang: Option<String>, code: String },
-    ListItem { ordered: bool, text: String },
+    ListItem { ordered: bool, checked: Option<bool>, text: String },
     BlockQuote { text: String },
     HorizontalRule,
     Html { content: String },
+    Table { headers: Vec<String>, rows: Vec<Vec<String>> },
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +76,7 @@ pub struct StyledLine {
 pub struct StyledSpan {
     pub text: String,
     pub style: SpanStyle,
+    pub cell_col: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +90,14 @@ pub enum SpanStyle {
     BlockQuote,
     Dimmed,
     Error,
+    TableHeader,
+    TableBorder,
+    Keyword,
+    StringLit,
+    Comment,
+    Number,
+    Operator,
+    Bracket,
 }
 
 impl Document {
@@ -144,6 +155,7 @@ impl Document {
         let events: Vec<(Event, std::ops::Range<usize>)> = iter.collect();
 
         let mut i = 0;
+        let mut ordered_stack: Vec<bool> = Vec::new();
         while i < events.len() {
             let (ref event, ref range) = events[i];
             match event {
@@ -219,10 +231,18 @@ impl Document {
                     let anchor = unique_anchor(&prefix, &mut counters);
                     nodes.push(DocNode { anchor, kind: NodeKind::CodeBlock { lang, code }, source_start: start, source_end: end });
                 }
+                Event::Start(Tag::List(start_num)) => {
+                    ordered_stack.push(start_num.is_some());
+                }
+                Event::End(TagEnd::List(_)) => {
+                    ordered_stack.pop();
+                }
                 Event::Start(Tag::Item) => {
                     let start = range.start;
                     let mut text = String::new();
+                    let mut checked: Option<bool> = None;
                     let mut end = range.end;
+                    let ordered = *ordered_stack.last().unwrap_or(&false);
                     i += 1;
                     while i < events.len() {
                         match &events[i].0 {
@@ -230,6 +250,7 @@ impl Document {
                                 end = events[i].1.end;
                                 break;
                             }
+                            Event::TaskListMarker(c) => { checked = Some(*c); }
                             Event::Text(t) => text.push_str(t),
                             Event::Code(t) => { text.push('`'); text.push_str(t); text.push('`'); }
                             Event::SoftBreak => text.push(' '),
@@ -238,7 +259,7 @@ impl Document {
                         i += 1;
                     }
                     let anchor = unique_anchor("li", &mut counters);
-                    nodes.push(DocNode { anchor, kind: NodeKind::ListItem { ordered: false, text }, source_start: start, source_end: end });
+                    nodes.push(DocNode { anchor, kind: NodeKind::ListItem { ordered, checked, text }, source_start: start, source_end: end });
                 }
                 Event::Start(Tag::BlockQuote(_)) => {
                     let start = range.start;
@@ -266,6 +287,44 @@ impl Document {
                 Event::Html(content) => {
                     let anchor = unique_anchor("html", &mut counters);
                     nodes.push(DocNode { anchor, kind: NodeKind::Html { content: content.to_string() }, source_start: range.start, source_end: range.end });
+                }
+                Event::Start(Tag::Table(_)) => {
+                    let start = range.start;
+                    let mut headers: Vec<String> = Vec::new();
+                    let mut rows: Vec<Vec<String>> = Vec::new();
+                    let mut end = range.end;
+                    let mut in_head = false;
+                    let mut current_row: Vec<String> = Vec::new();
+                    let mut current_cell = String::new();
+                    i += 1;
+                    while i < events.len() {
+                        match &events[i].0 {
+                            Event::End(TagEnd::Table) => { end = events[i].1.end; break; }
+                            Event::Start(Tag::TableHead) => { in_head = true; }
+                            Event::End(TagEnd::TableHead) => {
+                                if !current_row.is_empty() {
+                                    headers = std::mem::take(&mut current_row);
+                                }
+                                in_head = false;
+                            }
+                            Event::Start(Tag::TableRow) => { current_row = Vec::new(); }
+                            Event::End(TagEnd::TableRow) => {
+                                if !in_head && !current_row.is_empty() {
+                                    rows.push(std::mem::take(&mut current_row));
+                                }
+                            }
+                            Event::Start(Tag::TableCell) => { current_cell = String::new(); }
+                            Event::End(TagEnd::TableCell) => {
+                                current_row.push(std::mem::take(&mut current_cell));
+                            }
+                            Event::Text(t) => { current_cell.push_str(t); }
+                            Event::Code(t) => { current_cell.push('`'); current_cell.push_str(t); current_cell.push('`'); }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    let anchor = unique_anchor("tbl", &mut counters);
+                    nodes.push(DocNode { anchor, kind: NodeKind::Table { headers, rows }, source_start: start, source_end: end });
                 }
                 _ => {}
             }
@@ -457,8 +516,8 @@ impl Document {
                     lines.push(StyledLine {
                         text: format!("{}{}", icon, heading_text),
                         spans: vec![
-                            StyledSpan { text: icon.to_string(), style: icon_style },
-                            StyledSpan { text: heading_text, style: SpanStyle::Heading(*level) },
+                            StyledSpan { text: icon.to_string(), style: icon_style, cell_col: None },
+                            StyledSpan { text: heading_text, style: SpanStyle::Heading(*level), cell_col: None },
                         ],
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
@@ -472,9 +531,10 @@ impl Document {
                 NodeKind::Paragraph { text } => {
                     let wrapped = word_wrap(text, width.saturating_sub(2));
                     for (li, line) in wrapped.into_iter().enumerate() {
+                        let spans = inline_spans(&line, SpanStyle::Normal);
                         lines.push(StyledLine {
-                            text: line.clone(),
-                            spans: vec![StyledSpan { text: line, style: SpanStyle::Normal }],
+                            text: line,
+                            spans,
                             anchor: if li == 0 { Some(node.anchor.clone()) } else { None },
                             node_index: if li == 0 { Some(idx) } else { None },
                             line_in_block: None,
@@ -484,38 +544,54 @@ impl Document {
                 }
                 NodeKind::CodeBlock { lang, code } => {
                     let lang_str = lang.as_deref().unwrap_or("");
-                    let header = format!("```{}", lang_str);
+                    let header = if lang_str.is_empty() {
+                        "  ▌".to_string()
+                    } else {
+                        format!("  ▌ {}", lang_str)
+                    };
                     lines.push(StyledLine {
                         text: header.clone(),
-                        spans: vec![StyledSpan { text: header, style: SpanStyle::Dimmed }],
+                        spans: vec![StyledSpan { text: header, style: SpanStyle::Dimmed, cell_col: None }],
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
                     });
                     for (li, cline) in code.lines().enumerate() {
+                        let hl_spans: Vec<StyledSpan> = highlight::highlight_line(lang_str, cline)
+                            .into_iter()
+                            .map(|(style, text)| StyledSpan { text, style, cell_col: None })
+                            .collect();
+                        let spans = if hl_spans.is_empty() {
+                            vec![StyledSpan { text: cline.to_string(), style: SpanStyle::CodeBlockLine, cell_col: None }]
+                        } else {
+                            hl_spans
+                        };
                         lines.push(StyledLine {
                             text: cline.to_string(),
-                            spans: vec![StyledSpan { text: cline.to_string(), style: SpanStyle::CodeBlockLine }],
+                            spans,
                             anchor: None,
                             node_index: Some(idx),
                             line_in_block: Some(li),
                         });
                     }
-                    lines.push(StyledLine {
-                        text: "```".to_string(),
-                        spans: vec![StyledSpan { text: "```".to_string(), style: SpanStyle::Dimmed }],
-                        anchor: None,
-                        node_index: Some(idx),
-                        line_in_block: None,
-                    });
                     lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None });
                 }
-                NodeKind::ListItem { ordered, text } => {
+                NodeKind::ListItem { ordered, checked, text } => {
                     let bullet = if *ordered { "1." } else { "•" };
-                    let line_text = format!("  {} {}", bullet, text);
+                    let check = match checked {
+                        Some(true) => "[✓] ",
+                        Some(false) => "[ ] ",
+                        None => "",
+                    };
+                    let base_style = if matches!(checked, Some(true)) { SpanStyle::Dimmed } else { SpanStyle::Normal };
+                    let prefix = format!("  {} {}", bullet, check);
+                    let line_text = format!("{}{}", prefix, text);
+                    let mut spans = vec![StyledSpan { text: prefix, style: base_style.clone(), cell_col: None }];
+                    let mut text_spans = inline_spans(text, base_style);
+                    spans.append(&mut text_spans);
                     lines.push(StyledLine {
-                        text: line_text.clone(),
-                        spans: vec![StyledSpan { text: line_text, style: SpanStyle::Normal }],
+                        text: line_text,
+                        spans,
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
@@ -532,7 +608,7 @@ impl Document {
                     let line_text = format!("▌ {}", text);
                     lines.push(StyledLine {
                         text: line_text.clone(),
-                        spans: vec![StyledSpan { text: line_text, style: SpanStyle::BlockQuote }],
+                        spans: vec![StyledSpan { text: line_text, style: SpanStyle::BlockQuote, cell_col: None }],
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
@@ -543,7 +619,7 @@ impl Document {
                     let line_text = "─".repeat(width.min(60));
                     lines.push(StyledLine {
                         text: line_text.clone(),
-                        spans: vec![StyledSpan { text: line_text, style: SpanStyle::Dimmed }],
+                        spans: vec![StyledSpan { text: line_text, style: SpanStyle::Dimmed, cell_col: None }],
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
@@ -552,11 +628,100 @@ impl Document {
                 NodeKind::Html { content } => {
                     lines.push(StyledLine {
                         text: content.clone(),
-                        spans: vec![StyledSpan { text: content.clone(), style: SpanStyle::Dimmed }],
+                        spans: vec![StyledSpan { text: content.clone(), style: SpanStyle::Dimmed, cell_col: None }],
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
                     });
+                }
+                NodeKind::Table { headers, rows } => {
+                    let col_count = headers.len();
+                    if col_count == 0 { continue; }
+                    let mut col_widths: Vec<usize> = headers.iter()
+                        .map(|h| visual_len(h).max(3))
+                        .collect();
+                    for row in rows.iter() {
+                        for (j, cell) in row.iter().enumerate() {
+                            if j < col_widths.len() {
+                                col_widths[j] = col_widths[j].max(visual_len(cell));
+                            }
+                        }
+                    }
+                    let total = col_widths.iter().sum::<usize>() + col_count * 2 + col_count.saturating_sub(1);
+                    if total > width && width > col_count * 4 {
+                        let available = width.saturating_sub(col_count * 2 + col_count.saturating_sub(1));
+                        let sum: usize = col_widths.iter().sum::<usize>().max(1);
+                        for w in &mut col_widths {
+                            *w = ((*w * available) / sum).max(3);
+                        }
+                    }
+                    let make_row = |cells: &[String], is_header: bool| -> (String, Vec<StyledSpan>) {
+                        let mut text = String::new();
+                        let mut spans = Vec::new();
+                        for (j, cell) in cells.iter().enumerate() {
+                            let w = col_widths.get(j).copied().unwrap_or(3);
+                            let base_style = if is_header { SpanStyle::TableHeader } else { SpanStyle::Normal };
+                            let (cell_segs, cell_vis) = inline_segments(cell, w, base_style.clone());
+                            let padding = " ".repeat(w.saturating_sub(cell_vis));
+                            // leading space
+                            text.push(' ');
+                            spans.push(StyledSpan { text: " ".to_string(), style: base_style.clone(), cell_col: Some(j) });
+                            // cell content
+                            for (seg_text, seg_style) in cell_segs {
+                                text.push_str(&seg_text);
+                                spans.push(StyledSpan { text: seg_text, style: seg_style, cell_col: Some(j) });
+                            }
+                            // right-padding
+                            if !padding.is_empty() {
+                                text.push_str(&padding);
+                                spans.push(StyledSpan { text: padding, style: base_style.clone(), cell_col: Some(j) });
+                            }
+                            // trailing space
+                            text.push(' ');
+                            spans.push(StyledSpan { text: " ".to_string(), style: base_style.clone(), cell_col: Some(j) });
+                            if j + 1 < col_count {
+                                text.push('│');
+                                spans.push(StyledSpan { text: "│".to_string(), style: SpanStyle::TableBorder, cell_col: None });
+                            }
+                        }
+                        (text, spans)
+                    };
+                    let header_cells: Vec<String> = headers.clone();
+                    let (header_text, header_spans) = make_row(&header_cells, true);
+                    lines.push(StyledLine {
+                        text: header_text,
+                        spans: header_spans,
+                        anchor: Some(node.anchor.clone()),
+                        node_index: Some(idx),
+                        line_in_block: None,
+                    });
+                    let sep: String = col_widths.iter().enumerate()
+                        .map(|(j, &w)| {
+                            let seg = "─".repeat(w + 2);
+                            if j + 1 < col_count { format!("{}┼", seg) } else { seg }
+                        })
+                        .collect();
+                    lines.push(StyledLine {
+                        text: sep.clone(),
+                        spans: vec![StyledSpan { text: sep, style: SpanStyle::TableBorder, cell_col: None }],
+                        anchor: None,
+                        node_index: Some(idx),
+                        line_in_block: None,
+                    });
+                    for (ri, row) in rows.iter().enumerate() {
+                        let cells: Vec<String> = (0..col_count)
+                            .map(|j| row.get(j).cloned().unwrap_or_default())
+                            .collect();
+                        let (row_text, row_spans) = make_row(&cells, false);
+                        lines.push(StyledLine {
+                            text: row_text,
+                            spans: row_spans,
+                            anchor: None,
+                            node_index: Some(idx),
+                            line_in_block: Some(ri),
+                        });
+                    }
+                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None });
                 }
             }
         }
@@ -596,10 +761,16 @@ impl Document {
                 NodeKind::Heading { text, .. } => format!("Heading({})", truncate_chars(text, 40)),
                 NodeKind::Paragraph { text } => format!("Paragraph({})", truncate_chars(text, 40)),
                 NodeKind::CodeBlock { lang, .. } => format!("CodeBlock({:?})", lang),
-                NodeKind::ListItem { text, .. } => format!("ListItem({})", truncate_chars(text, 40)),
+                NodeKind::ListItem { text, checked, .. } => {
+                    let check = match checked {
+                        Some(true) => "[x] ", Some(false) => "[ ] ", None => "",
+                    };
+                    format!("ListItem({}{})", check, truncate_chars(text, 40))
+                }
                 NodeKind::BlockQuote { text } => format!("BlockQuote({})", truncate_chars(text, 40)),
                 NodeKind::HorizontalRule => "HorizontalRule".to_string(),
                 NodeKind::Html { .. } => "Html".to_string(),
+                NodeKind::Table { headers, rows } => format!("Table({}col×{}row)", headers.len(), rows.len()),
             }))
             .collect::<Vec<_>>()
             .join("\n")
@@ -647,6 +818,19 @@ impl Document {
                             }
                             hits.push((line_anchor, line.trim_end().to_string()));
                         }
+                    }
+                }
+                NodeKind::Table { headers, rows } => {
+                    let mut all_cells: Vec<String> = headers.clone();
+                    for row in rows { all_cells.extend_from_slice(row); }
+                    let combined = all_cells.join(" ");
+                    if combined.to_lowercase().contains(&q) {
+                        let snippet = if combined.chars().count() > 80 {
+                            format!("{}…", truncate_chars(&combined, 80))
+                        } else {
+                            combined
+                        };
+                        hits.push((node.anchor.clone(), snippet));
                     }
                 }
                 _ => {}
@@ -710,6 +894,144 @@ mod tests {
         let text = "signals — externally fed";
         assert_eq!(truncate_chars(text, 10), "signals — ");
     }
+}
+
+/// Rebuild the raw markdown for a table, escaping any pipe characters in cell
+/// content.  Used when applying a direct-edit to a single table cell.
+pub fn rebuild_table_raw(headers: &[String], rows: &[Vec<String>]) -> String {
+    let col_count = headers.len();
+    let mut result = String::new();
+    result.push('|');
+    for h in headers {
+        result.push(' ');
+        result.push_str(&h.replace('|', "\\|"));
+        result.push_str(" |");
+    }
+    result.push('\n');
+    result.push('|');
+    for _ in 0..col_count {
+        result.push_str(" --- |");
+    }
+    result.push('\n');
+    for row in rows {
+        result.push('|');
+        for cell in row.iter() {
+            result.push(' ');
+            result.push_str(&cell.replace('|', "\\|"));
+            result.push_str(" |");
+        }
+        result.push('\n');
+    }
+    result
+}
+
+/// Visual character count of `text`, not counting backtick delimiters in
+/// matched `` `...` `` inline-code pairs.
+fn visual_len(text: &str) -> usize {
+    let mut len = 0;
+    let mut remaining = text;
+    loop {
+        if let Some(open) = remaining.find('`') {
+            len += remaining[..open].chars().count();
+            let after = &remaining[open + 1..];
+            if let Some(close) = after.find('`') {
+                len += after[..close].chars().count();
+                remaining = &after[close + 1..];
+            } else {
+                len += 1 + after.chars().count(); // unmatched backtick counts as-is
+                break;
+            }
+        } else {
+            len += remaining.chars().count();
+            break;
+        }
+    }
+    len
+}
+
+/// Split `text` into styled spans, applying `SpanStyle::Code` to backtick-delimited
+/// inline-code fragments and `base_style` to surrounding text.  The backtick
+/// delimiters themselves are consumed (not emitted).
+fn inline_spans(text: &str, base_style: SpanStyle) -> Vec<StyledSpan> {
+    let mut result = Vec::new();
+    let mut remaining = text;
+    loop {
+        if let Some(open) = remaining.find('`') {
+            let before = &remaining[..open];
+            if !before.is_empty() {
+                result.push(StyledSpan { text: before.to_string(), style: base_style.clone(), cell_col: None });
+            }
+            let after = &remaining[open + 1..];
+            if let Some(close) = after.find('`') {
+                let code = &after[..close];
+                if !code.is_empty() {
+                    result.push(StyledSpan { text: code.to_string(), style: SpanStyle::Code, cell_col: None });
+                }
+                remaining = &after[close + 1..];
+            } else {
+                // Unmatched backtick — emit the rest verbatim
+                let rest = &remaining[open..];
+                if !rest.is_empty() {
+                    result.push(StyledSpan { text: rest.to_string(), style: base_style.clone(), cell_col: None });
+                }
+                break;
+            }
+        } else {
+            if !remaining.is_empty() {
+                result.push(StyledSpan { text: remaining.to_string(), style: base_style.clone(), cell_col: None });
+            }
+            break;
+        }
+    }
+    if result.is_empty() {
+        result.push(StyledSpan { text: String::new(), style: base_style, cell_col: None });
+    }
+    result
+}
+
+/// Like `inline_spans` but truncates to `max_width` visual characters and
+/// returns the actual visual width used (for table-cell padding).
+fn inline_segments(text: &str, max_width: usize, base_style: SpanStyle) -> (Vec<(String, SpanStyle)>, usize) {
+    let mut segments: Vec<(String, SpanStyle)> = Vec::new();
+    let mut remaining = text;
+    let mut used = 0usize;
+    loop {
+        if used >= max_width { break; }
+        if let Some(open) = remaining.find('`') {
+            let before = &remaining[..open];
+            if !before.is_empty() {
+                let trunc: String = before.chars().take(max_width - used).collect();
+                used += trunc.chars().count();
+                segments.push((trunc, base_style.clone()));
+            }
+            if used >= max_width { break; }
+            let after = &remaining[open + 1..];
+            if let Some(close) = after.find('`') {
+                let code = &after[..close];
+                let trunc: String = code.chars().take(max_width - used).collect();
+                used += trunc.chars().count();
+                if !trunc.is_empty() {
+                    segments.push((trunc, SpanStyle::Code));
+                }
+                remaining = &after[close + 1..];
+            } else {
+                // Unmatched backtick — treat the rest (including backtick) as plain text
+                let rest = &remaining[open..];
+                let trunc: String = rest.chars().take(max_width - used).collect();
+                used += trunc.chars().count();
+                segments.push((trunc, base_style.clone()));
+                break;
+            }
+        } else {
+            let trunc: String = remaining.chars().take(max_width - used).collect();
+            used += trunc.chars().count();
+            if !trunc.is_empty() {
+                segments.push((trunc, base_style.clone()));
+            }
+            break;
+        }
+    }
+    (segments, used)
 }
 
 fn word_wrap(text: &str, width: usize) -> Vec<String> {

@@ -86,9 +86,13 @@ async fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') => { app.clear_occurrences(); app.select_prev_node(); }
         KeyCode::Down | KeyCode::Char('j') => { app.clear_occurrences(); app.select_next_node(); }
         KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.collapse_headings_below(),
-        KeyCode::Left => app.collapse_heading(),
+        KeyCode::Left => {
+            if app.is_on_table() { app.table_prev_col(); } else { app.collapse_heading(); }
+        }
         KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.expand_headings_below(),
-        KeyCode::Right => app.expand_heading(),
+        KeyCode::Right => {
+            if app.is_on_table() { app.table_next_col(); } else { app.expand_heading(); }
+        }
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
         KeyCode::Char('g') => app.scroll_offset = 0,
@@ -113,6 +117,7 @@ async fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.clear_occurrences();
             app.selected_node = None;
+            app.selected_table_col = None;
             app.status_message = Some("Press ? for help".to_string());
         }
         _ => {}

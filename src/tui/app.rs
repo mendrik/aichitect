@@ -103,6 +103,10 @@ pub struct App {
     pub open_review_when_ready: bool,
     /// Anchor currently being edited in DirectEdit mode.
     pub direct_edit_anchor: Option<String>,
+    /// Column highlighted in the currently selected Table node (None = whole row).
+    pub selected_table_col: Option<usize>,
+    /// (row, col) of the table cell being edited via DirectEdit.
+    pub direct_edit_table_cell: Option<(usize, usize)>,
 }
 
 impl App {
@@ -151,6 +155,8 @@ impl App {
             request_progress: None,
             open_review_when_ready: false,
             direct_edit_anchor: None,
+            selected_table_col: None,
+            direct_edit_table_cell: None,
         }
     }
 
@@ -258,6 +264,58 @@ impl App {
             .unwrap_or(false)
     }
 
+    fn is_table(&self, node_idx: usize) -> bool {
+        self.doc.nodes.get(node_idx)
+            .map(|n| matches!(n.kind, crate::document::NodeKind::Table { .. }))
+            .unwrap_or(false)
+    }
+
+    fn table_row_count(&self, node_idx: usize) -> usize {
+        if let Some(node) = self.doc.nodes.get(node_idx) {
+            if let crate::document::NodeKind::Table { rows, .. } = &node.kind {
+                return rows.len();
+            }
+        }
+        0
+    }
+
+    fn table_col_count(&self, node_idx: usize) -> usize {
+        if let Some(node) = self.doc.nodes.get(node_idx) {
+            if let crate::document::NodeKind::Table { headers, .. } = &node.kind {
+                return headers.len();
+            }
+        }
+        0
+    }
+
+    pub fn is_on_table(&self) -> bool {
+        self.selected_node
+            .map(|ni| self.is_table(ni) && self.selected_line_in_node.is_some())
+            .unwrap_or(false)
+    }
+
+    pub fn table_next_col(&mut self) {
+        if let Some(ni) = self.selected_node {
+            let col_count = self.table_col_count(ni);
+            if col_count == 0 { return; }
+            self.selected_table_col = Some(match self.selected_table_col {
+                None => 0,
+                Some(c) => (c + 1).min(col_count - 1),
+            });
+        }
+    }
+
+    pub fn table_prev_col(&mut self) {
+        if let Some(ni) = self.selected_node {
+            let col_count = self.table_col_count(ni);
+            if col_count == 0 { return; }
+            self.selected_table_col = Some(match self.selected_table_col {
+                None | Some(0) => 0,
+                Some(c) => c - 1,
+            });
+        }
+    }
+
     pub fn select_next_node(&mut self) {
         // If we're inside a code block, navigate line-by-line first.
         if let (Some(cur), Some(line)) = (self.selected_node, self.selected_line_in_node) {
@@ -268,8 +326,16 @@ impl App {
                     self.scroll_to_code_line(cur, line + 1);
                     return;
                 }
-                // Fall through to move to next node, clearing intra-block selection.
                 self.selected_line_in_node = None;
+            } else if self.is_table(cur) {
+                let count = self.table_row_count(cur);
+                if line + 1 < count {
+                    self.selected_line_in_node = Some(line + 1);
+                    self.scroll_to_code_line(cur, line + 1);
+                    return;
+                }
+                self.selected_line_in_node = None;
+                self.selected_table_col = None;
             }
         }
 
@@ -282,11 +348,15 @@ impl App {
                 visible[(pos + 1).min(visible.len() - 1)]
             }
         };
-        // Entering a code block: start at first line.
         if self.is_code_block(next) && self.code_block_line_count(next) > 0 {
             self.selected_line_in_node = Some(0);
+            self.selected_table_col = None;
+        } else if self.is_table(next) && self.table_row_count(next) > 0 {
+            self.selected_line_in_node = Some(0);
+            self.selected_table_col = None;
         } else {
             self.selected_line_in_node = None;
+            self.selected_table_col = None;
         }
         self.selected_node = Some(next);
         if let Some(line) = self.selected_line_in_node {
@@ -305,8 +375,15 @@ impl App {
                     self.scroll_to_code_line(cur, line - 1);
                     return;
                 }
-                // Fall through to move to previous node, clearing intra-block selection.
                 self.selected_line_in_node = None;
+            } else if self.is_table(cur) {
+                if line > 0 {
+                    self.selected_line_in_node = Some(line - 1);
+                    self.scroll_to_code_line(cur, line - 1);
+                    return;
+                }
+                self.selected_line_in_node = None;
+                self.selected_table_col = None;
             }
         }
 
@@ -319,12 +396,17 @@ impl App {
                 visible[pos.saturating_sub(1)]
             }
         };
-        // Entering a code block from below: land on its last line.
         if self.is_code_block(prev) {
             let count = self.code_block_line_count(prev);
             self.selected_line_in_node = if count > 0 { Some(count - 1) } else { None };
+            self.selected_table_col = None;
+        } else if self.is_table(prev) {
+            let count = self.table_row_count(prev);
+            self.selected_line_in_node = if count > 0 { Some(count - 1) } else { None };
+            self.selected_table_col = None;
         } else {
             self.selected_line_in_node = None;
+            self.selected_table_col = None;
         }
         self.selected_node = Some(prev);
         if let Some(line) = self.selected_line_in_node {
@@ -595,9 +677,15 @@ impl App {
             self.selected_node = Some(node_idx);
             if self.is_code_block(node_idx) && self.code_block_line_count(node_idx) > 0 {
                 self.selected_line_in_node = Some(0);
+                self.selected_table_col = None;
+                self.scroll_to_code_line(node_idx, 0);
+            } else if self.is_table(node_idx) && self.table_row_count(node_idx) > 0 {
+                self.selected_line_in_node = Some(0);
+                self.selected_table_col = None;
                 self.scroll_to_code_line(node_idx, 0);
             } else {
                 self.selected_line_in_node = None;
+                self.selected_table_col = None;
                 self.scroll_to_node(node_idx);
             }
         }
@@ -610,6 +698,12 @@ impl App {
         if let crate::document::NodeKind::CodeBlock { code, .. } = &node.kind {
             if let Some(line_idx) = self.selected_line_in_node {
                 return Some(code.lines().nth(line_idx).unwrap_or("").to_string());
+            }
+        }
+
+        if let crate::document::NodeKind::Table { rows, .. } = &node.kind {
+            if let (Some(row_idx), Some(col_idx)) = (self.selected_line_in_node, self.selected_table_col) {
+                return rows.get(row_idx).and_then(|r| r.get(col_idx)).cloned();
             }
         }
 
@@ -726,6 +820,28 @@ impl App {
             return;
         };
 
+        // Table cell editing: requires a row + column to be selected.
+        if let crate::document::NodeKind::Table { rows, .. } = &node.kind {
+            match (self.selected_line_in_node, self.selected_table_col) {
+                (Some(row_idx), Some(col_idx)) => {
+                    let cell = rows.get(row_idx)
+                        .and_then(|r| r.get(col_idx))
+                        .cloned()
+                        .unwrap_or_default();
+                    self.direct_edit_anchor = Some(node.anchor.clone());
+                    self.direct_edit_table_cell = Some((row_idx, col_idx));
+                    self.input.set_text(cell);
+                    self.mode = AppMode::DirectEdit;
+                    self.status_message = Some("Editing cell. Enter save  Esc cancel  (pipes escaped automatically)".to_string());
+                    return;
+                }
+                _ => {
+                    self.status_message = Some("Navigate to a cell first (←→ to select a column, then Ctrl+E).".to_string());
+                    return;
+                }
+            }
+        }
+
         let (anchor, initial_text) = match &node.kind {
             crate::document::NodeKind::CodeBlock { code, .. } => {
                 if let Some(line_idx) = self.selected_line_in_node {
@@ -759,6 +875,60 @@ impl App {
             self.mode = AppMode::Normal;
             return;
         };
+
+        // Table cell edit path.
+        if let Some((row_idx, col_idx)) = self.direct_edit_table_cell {
+            let new_cell = self.input.text().to_string();
+            let node_idx = match self.doc.anchor_map.get(&anchor) {
+                Some(&i) => i,
+                None => {
+                    self.status_message = Some("Edited table no longer exists.".to_string());
+                    self.mode = AppMode::Normal;
+                    self.input.clear();
+                    self.direct_edit_anchor = None;
+                    self.direct_edit_table_cell = None;
+                    return;
+                }
+            };
+            if let Some(crate::document::NodeKind::Table { headers, rows }) =
+                self.doc.nodes.get(node_idx).map(|n| n.kind.clone())
+            {
+                let mut new_rows = rows.clone();
+                if row_idx < new_rows.len() && col_idx < new_rows[row_idx].len() {
+                    new_rows[row_idx][col_idx] = new_cell;
+                }
+                let new_raw = crate::document::rebuild_table_raw(&headers, &new_rows);
+                let patch = PatchOp::ReplaceSection {
+                    anchor: anchor.clone(),
+                    content: new_raw,
+                    rationale: "local direct edit".to_string(),
+                };
+                self.direct_edit_table_cell = None;
+                match self.doc.apply_patches(vec![patch], None) {
+                    Ok((applied, skipped)) => {
+                        self.refresh_display();
+                        self.input.clear();
+                        self.direct_edit_anchor = None;
+                        self.mode = AppMode::Normal;
+                        if let Err(e) = self.doc.save() {
+                            self.status_message = Some(format!("Saved in memory, write failed: {}", e));
+                        } else if skipped.is_empty() {
+                            self.status_message = Some(format!("Updated {} block(s) locally.", applied.len()));
+                        } else {
+                            self.status_message = Some(format!("Updated {}, skipped {}.", applied.len(), skipped.len()));
+                        }
+                    }
+                    Err(e) => { self.status_message = Some(format!("Cell edit failed: {}", e)); }
+                }
+            } else {
+                self.direct_edit_table_cell = None;
+                self.status_message = Some("Table no longer available.".to_string());
+                self.mode = AppMode::Normal;
+                self.input.clear();
+                self.direct_edit_anchor = None;
+            }
+            return;
+        }
 
         let replacement = self.input.text().to_string();
         let patch = if let Some((node_anchor, line_str)) = anchor.split_once(":L") {
@@ -1054,6 +1224,7 @@ impl App {
     pub fn cancel_input(&mut self) {
         self.input.clear();
         self.direct_edit_anchor = None;
+        self.direct_edit_table_cell = None;
         self.mode = AppMode::Normal;
     }
 

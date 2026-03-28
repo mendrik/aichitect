@@ -98,6 +98,14 @@ fn span_style_to_ratatui(style: &SpanStyle) -> Style {
         SpanStyle::BlockQuote => Style::default().fg(Color::LightMagenta).add_modifier(Modifier::ITALIC),
         SpanStyle::Dimmed => Style::default().fg(Color::DarkGray),
         SpanStyle::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        SpanStyle::TableHeader => Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        SpanStyle::TableBorder => Style::default().fg(Color::DarkGray),
+        SpanStyle::Keyword => Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+        SpanStyle::StringLit => Style::default().fg(Color::LightGreen),
+        SpanStyle::Comment => Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        SpanStyle::Number => Style::default().fg(Color::LightYellow),
+        SpanStyle::Operator => Style::default().fg(Color::Gray),
+        SpanStyle::Bracket => Style::default().fg(Color::LightMagenta),
     }
 }
 
@@ -187,9 +195,16 @@ fn draw_document(f: &mut Frame, app: &App, area: Rect) {
             if sl.spans.is_empty() {
                 Line::from("")
             } else {
+                let selected_col = app.selected_table_col;
                 let spans: Vec<Span> = sl.spans.iter().map(|s| {
                     let mut style = span_style_to_ratatui(&s.style);
-                    if is_selected {
+                    // For table rows, only highlight the selected cell span (or all if no column selected).
+                    let apply_sel = is_selected && match (s.cell_col, selected_col) {
+                        (Some(sc), Some(tc)) => sc == tc,
+                        (None, Some(_)) => false,
+                        _ => true,
+                    };
+                    if apply_sel {
                         style = style.bg(Color::DarkGray);
                     } else if is_occurrence {
                         style = style.bg(Color::Yellow).fg(Color::Black);
