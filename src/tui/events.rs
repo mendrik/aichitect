@@ -13,11 +13,6 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if matches!(key.code, KeyCode::Char('e')) && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.start_direct_edit();
-        return;
-    }
-
     match app.mode {
         AppMode::Normal => handle_normal(app, key).await,
         AppMode::Search => handle_search_mode(app, key),
@@ -83,8 +78,8 @@ async fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_search(),
         KeyCode::Char('?') => app.mode = AppMode::Help,
-        KeyCode::Up | KeyCode::Char('k') => { app.clear_occurrences(); app.select_prev_node(); }
-        KeyCode::Down | KeyCode::Char('j') => { app.clear_occurrences(); app.select_next_node(); }
+        KeyCode::Up => { app.clear_occurrences(); app.select_prev_node(); }
+        KeyCode::Down => { app.clear_occurrences(); app.select_next_node(); }
         KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.collapse_headings_below(),
         KeyCode::Left => {
             if app.is_on_table() { app.table_prev_col(); } else { app.collapse_heading(); }
@@ -95,20 +90,17 @@ async fn handle_normal(app: &mut App, key: KeyEvent) {
         }
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
-        KeyCode::Char('g') => app.scroll_offset = 0,
-        KeyCode::Char('G') => {
+        KeyCode::Home => app.scroll_offset = 0,
+        KeyCode::End => {
             app.scroll_offset = app.display_lines.len().saturating_sub(1);
         }
-        KeyCode::Char('J') => app.scroll_down(),
-        KeyCode::Char('K') => app.scroll_up(),
-        KeyCode::Char(' ') => app.toggle_collapse(),
+        KeyCode::Enter => app.activate_link(),
         KeyCode::Char('c') => app.toggle_collapse_all(),
-        KeyCode::Char('r') => app.start_remark(),
-        KeyCode::Char('f') => app.find_and_show_occurrences(),
+        KeyCode::Char('e') => app.start_direct_edit(),
+        KeyCode::Char('r') => app.find_and_show_occurrences(),
         KeyCode::Char('R') => {
             app.show_remarks_panel = !app.show_remarks_panel;
         }
-        KeyCode::Char('S') => app.send_remarks().await,
         KeyCode::Char('A') => app.open_review_panel().await,
         KeyCode::Char('H') => app.open_history(),
         KeyCode::Char('w') | KeyCode::Char('W') => app.save_doc(),
@@ -197,7 +189,7 @@ async fn handle_review_mode(app: &mut App, key: KeyEvent) {
                 app.open_review_panel().await;
             }
         }
-        KeyCode::Char('j') | KeyCode::Down => {
+        KeyCode::Down => {
             if pending_len > 0 {
                 app.selected_review = Some(
                     app.selected_review
@@ -206,7 +198,7 @@ async fn handle_review_mode(app: &mut App, key: KeyEvent) {
                 );
             }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Up => {
             if pending_len > 0 {
                 app.selected_review = Some(
                     app.selected_review
@@ -298,8 +290,8 @@ fn handle_history_browser(app: &mut App, key: KeyEvent) {
             app.mode = AppMode::Normal;
             app.status_message = Some("History closed.".to_string());
         }
-        KeyCode::Char('j') | KeyCode::Down => app.history_next(),
-        KeyCode::Char('k') | KeyCode::Up => app.history_prev(),
+        KeyCode::Down => app.history_next(),
+        KeyCode::Up => app.history_prev(),
         KeyCode::PageDown => {
             app.history_scroll = app.history_scroll.saturating_add(10);
         }

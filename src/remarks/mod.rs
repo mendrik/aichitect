@@ -15,7 +15,8 @@ pub enum TargetType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RemarkStatus {
     Draft,
-    Queued,
+    #[serde(alias = "Queued")]
+    Pending,
     Sent,
     Applied,
     Failed,
@@ -47,8 +48,8 @@ impl RemarkStore {
     pub fn add(&mut self, r: Remark) { self.remarks.push(r); }
     #[allow(dead_code)]
     pub fn remove(&mut self, id: Uuid) { self.remarks.retain(|r| r.id != id); }
-    pub fn queued(&self) -> Vec<&Remark> {
-        self.remarks.iter().filter(|r| r.status == RemarkStatus::Queued).collect()
+    pub fn pending(&self) -> Vec<&Remark> {
+        self.remarks.iter().filter(|r| r.status == RemarkStatus::Pending).collect()
     }
     #[allow(dead_code)]
     pub fn mark_sent(&mut self, id: Uuid) {

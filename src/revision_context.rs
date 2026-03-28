@@ -251,7 +251,7 @@ mod tests {
             list_context: None,
             occurrence_anchors: vec![(second_anchor, "alpha beta".to_string())],
             created_at: Utc::now(),
-            status: RemarkStatus::Queued,
+            status: RemarkStatus::Pending,
         };
 
         let plan = build_targeted_revision_plan(&doc, &[&remark]).expect("targeted plan");
@@ -283,7 +283,7 @@ mod tests {
             list_context: None,
             occurrence_anchors,
             created_at: Utc::now(),
-            status: RemarkStatus::Queued,
+            status: RemarkStatus::Pending,
         };
 
         assert!(build_targeted_revision_plan(&doc, &[&remark]).is_none());

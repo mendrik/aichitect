@@ -55,7 +55,7 @@ pub enum NodeKind {
     Heading { level: u8, text: String },
     Paragraph { text: String },
     CodeBlock { lang: Option<String>, code: String },
-    ListItem { ordered: bool, checked: Option<bool>, text: String },
+    ListItem { ordered: bool, index: usize, checked: Option<bool>, text: String },
     BlockQuote { text: String },
     HorizontalRule,
     Html { content: String },
@@ -70,6 +70,8 @@ pub struct StyledLine {
     pub node_index: Option<usize>,
     /// Index of this line within its parent code block (inner content lines only).
     pub line_in_block: Option<usize>,
+    /// URL of the first hyperlink in this line, if any.
+    pub first_link_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,8 @@ pub enum SpanStyle {
     Number,
     Operator,
     Bracket,
+    /// Inline hyperlink — the String payload is the URL.
+    Link(String),
 }
 
 impl Document {
@@ -155,7 +159,7 @@ impl Document {
         let events: Vec<(Event, std::ops::Range<usize>)> = iter.collect();
 
         let mut i = 0;
-        let mut ordered_stack: Vec<bool> = Vec::new();
+        let mut ordered_stack: Vec<(bool, usize)> = Vec::new();
         while i < events.len() {
             let (ref event, ref range) = events[i];
             match event {
@@ -232,7 +236,8 @@ impl Document {
                     nodes.push(DocNode { anchor, kind: NodeKind::CodeBlock { lang, code }, source_start: start, source_end: end });
                 }
                 Event::Start(Tag::List(start_num)) => {
-                    ordered_stack.push(start_num.is_some());
+                    let start_idx = start_num.unwrap_or(1) as usize;
+                    ordered_stack.push((start_num.is_some(), start_idx));
                 }
                 Event::End(TagEnd::List(_)) => {
                     ordered_stack.pop();
@@ -242,7 +247,14 @@ impl Document {
                     let mut text = String::new();
                     let mut checked: Option<bool> = None;
                     let mut end = range.end;
-                    let ordered = *ordered_stack.last().unwrap_or(&false);
+                    let (ordered, index) = match ordered_stack.last_mut() {
+                        Some((is_ord, idx)) => {
+                            let cur = *idx;
+                            *idx += 1;
+                            (*is_ord, cur)
+                        }
+                        None => (false, 1),
+                    };
                     i += 1;
                     while i < events.len() {
                         match &events[i].0 {
@@ -259,7 +271,7 @@ impl Document {
                         i += 1;
                     }
                     let anchor = unique_anchor("li", &mut counters);
-                    nodes.push(DocNode { anchor, kind: NodeKind::ListItem { ordered, checked, text }, source_start: start, source_end: end });
+                    nodes.push(DocNode { anchor, kind: NodeKind::ListItem { ordered, index, checked, text }, source_start: start, source_end: end });
                 }
                 Event::Start(Tag::BlockQuote(_)) => {
                     let start = range.start;
@@ -522,25 +534,33 @@ impl Document {
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
+                        first_link_url: None,
                     });
-                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None });
+                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None, first_link_url: None });
                     if is_collapsed {
                         skip_until_level = Some(*level);
                     }
                 }
                 NodeKind::Paragraph { text } => {
+                    let node_raw = &self.raw[node.source_start..node.source_end];
+                    let links = extract_links(node_raw);
+                    let first_url = links.first().map(|(_, url)| url.clone());
                     let wrapped = word_wrap(text, width.saturating_sub(2));
                     for (li, line) in wrapped.into_iter().enumerate() {
-                        let spans = inline_spans(&line, SpanStyle::Normal);
+                        let mut spans = inline_spans(&line, SpanStyle::Normal);
+                        for (link_text, url) in &links {
+                            mark_link_in_spans(&mut spans, link_text, url);
+                        }
                         lines.push(StyledLine {
                             text: line,
                             spans,
                             anchor: if li == 0 { Some(node.anchor.clone()) } else { None },
                             node_index: if li == 0 { Some(idx) } else { None },
                             line_in_block: None,
+                            first_link_url: if li == 0 { first_url.clone() } else { None },
                         });
                     }
-                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None });
+                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None, first_link_url: None });
                 }
                 NodeKind::CodeBlock { lang, code } => {
                     let lang_str = lang.as_deref().unwrap_or("");
@@ -555,6 +575,7 @@ impl Document {
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
+                        first_link_url: None,
                     });
                     for (li, cline) in code.lines().enumerate() {
                         let hl_spans: Vec<StyledSpan> = highlight::highlight_line(lang_str, cline)
@@ -572,12 +593,16 @@ impl Document {
                             anchor: None,
                             node_index: Some(idx),
                             line_in_block: Some(li),
+                            first_link_url: None,
                         });
                     }
-                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None });
+                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None, first_link_url: None });
                 }
-                NodeKind::ListItem { ordered, checked, text } => {
-                    let bullet = if *ordered { "1." } else { "•" };
+                NodeKind::ListItem { ordered, index, checked, text } => {
+                    let node_raw = &self.raw[node.source_start..node.source_end];
+                    let links = extract_links(node_raw);
+                    let first_url = links.first().map(|(_, url)| url.clone());
+                    let bullet = if *ordered { format!("{}.", index) } else { "•".to_string() };
                     let check = match checked {
                         Some(true) => "[✓] ",
                         Some(false) => "[ ] ",
@@ -588,6 +613,9 @@ impl Document {
                     let line_text = format!("{}{}", prefix, text);
                     let mut spans = vec![StyledSpan { text: prefix, style: base_style.clone(), cell_col: None }];
                     let mut text_spans = inline_spans(text, base_style);
+                    for (link_text, url) in &links {
+                        mark_link_in_spans(&mut text_spans, link_text, url);
+                    }
                     spans.append(&mut text_spans);
                     lines.push(StyledLine {
                         text: line_text,
@@ -595,25 +623,34 @@ impl Document {
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
+                        first_link_url: first_url,
                     });
                     // Blank line after the last item in a list.
                     let next_is_list = self.nodes.get(idx + 1)
                         .map(|n| matches!(n.kind, NodeKind::ListItem { .. }))
                         .unwrap_or(false);
                     if !next_is_list {
-                        lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None });
+                        lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None, first_link_url: None });
                     }
                 }
                 NodeKind::BlockQuote { text } => {
+                    let node_raw = &self.raw[node.source_start..node.source_end];
+                    let links = extract_links(node_raw);
+                    let first_url = links.first().map(|(_, url)| url.clone());
                     let line_text = format!("▌ {}", text);
+                    let mut spans = vec![StyledSpan { text: line_text.clone(), style: SpanStyle::BlockQuote, cell_col: None }];
+                    for (link_text, url) in &links {
+                        mark_link_in_spans(&mut spans, link_text, url);
+                    }
                     lines.push(StyledLine {
-                        text: line_text.clone(),
-                        spans: vec![StyledSpan { text: line_text, style: SpanStyle::BlockQuote, cell_col: None }],
+                        text: line_text,
+                        spans,
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
+                        first_link_url: first_url,
                     });
-                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None });
+                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None, first_link_url: None });
                 }
                 NodeKind::HorizontalRule => {
                     let line_text = "─".repeat(width.min(60));
@@ -623,6 +660,7 @@ impl Document {
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
+                        first_link_url: None,
                     });
                 }
                 NodeKind::Html { content } => {
@@ -632,6 +670,7 @@ impl Document {
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
+                        first_link_url: None,
                     });
                 }
                 NodeKind::Table { headers, rows } => {
@@ -694,6 +733,7 @@ impl Document {
                         anchor: Some(node.anchor.clone()),
                         node_index: Some(idx),
                         line_in_block: None,
+                        first_link_url: None,
                     });
                     let sep: String = col_widths.iter().enumerate()
                         .map(|(j, &w)| {
@@ -707,6 +747,7 @@ impl Document {
                         anchor: None,
                         node_index: Some(idx),
                         line_in_block: None,
+                        first_link_url: None,
                     });
                     for (ri, row) in rows.iter().enumerate() {
                         let cells: Vec<String> = (0..col_count)
@@ -719,9 +760,10 @@ impl Document {
                             anchor: None,
                             node_index: Some(idx),
                             line_in_block: Some(ri),
+                            first_link_url: None,
                         });
                     }
-                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None });
+                    lines.push(StyledLine { text: String::new(), spans: vec![], anchor: None, node_index: None, line_in_block: None, first_link_url: None });
                 }
             }
         }
@@ -729,7 +771,7 @@ impl Document {
     }
 
     /// Returns the indices of nodes that are currently visible (not hidden
-    /// inside a collapsed section).  Used by J/K navigation so the cursor
+    /// inside a collapsed section). Used by keyboard navigation so the cursor
     /// never lands on a hidden node.
     pub fn visible_node_indices(&self, collapsed: &HashSet<AnchorId>) -> Vec<usize> {
         let mut visible = Vec::new();
@@ -774,6 +816,26 @@ impl Document {
             }))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Resolve a markdown fragment (`#section-name`) to a node index.
+    /// Tries exact internal anchor match first, then GitHub-style heading slug.
+    pub fn resolve_fragment(&self, fragment: &str) -> Option<usize> {
+        let frag = fragment.trim_start_matches('#');
+        if frag.is_empty() { return None; }
+        // Exact match on internal anchor id (e.g. "h2-quick-start")
+        if let Some(&idx) = self.anchor_map.get(frag) {
+            return Some(idx);
+        }
+        // GitHub-style slug matching against heading text
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if let NodeKind::Heading { text, .. } = &node.kind {
+                if github_slug(text) == frag {
+                    return Some(idx);
+                }
+            }
+        }
+        None
     }
 
     /// Find all nodes (and code-block lines) whose text contains `query`
@@ -1032,6 +1094,82 @@ fn inline_segments(text: &str, max_width: usize, base_style: SpanStyle) -> (Vec<
         }
     }
     (segments, used)
+}
+
+/// Convert heading text to a GitHub-style anchor slug.
+fn github_slug(text: &str) -> String {
+    let mut result = String::new();
+    let mut last_hyphen = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            result.push(c.to_lowercase().next().unwrap_or(c));
+            last_hyphen = false;
+        } else if (c == '-' || c == ' ') && !result.is_empty() {
+            if !last_hyphen {
+                result.push('-');
+                last_hyphen = true;
+            }
+        }
+        // all other punctuation is dropped
+    }
+    result.trim_end_matches('-').to_string()
+}
+
+/// Extract all `[text](url)` inline links from a raw markdown string.
+/// Returns `(link_text, url)` pairs.
+fn extract_links(raw: &str) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    let mut remaining = raw;
+    loop {
+        let Some(open) = remaining.find('[') else { break };
+        let after_open = &remaining[open + 1..];
+        if let Some(close_bracket) = after_open.find("](") {
+            let link_text = &after_open[..close_bracket];
+            if !link_text.contains('\n') && !link_text.contains('[') {
+                let after_close = &after_open[close_bracket + 2..];
+                if let Some(close_paren) = after_close.find(')') {
+                    let url = after_close[..close_paren].trim();
+                    if !url.is_empty() && !url.contains('\n') {
+                        links.push((link_text.to_string(), url.to_string()));
+                    }
+                    remaining = &after_close[close_paren + 1..];
+                    continue;
+                }
+            }
+        }
+        remaining = &remaining[open + 1..];
+    }
+    links
+}
+
+/// Find `link_text` within `spans` and replace its occurrence with a Link span.
+/// Only the first matching Normal (or BlockQuote) span is processed.
+fn mark_link_in_spans(spans: &mut Vec<StyledSpan>, link_text: &str, url: &str) {
+    if link_text.is_empty() { return; }
+    let mut i = 0;
+    while i < spans.len() {
+        if !matches!(spans[i].style, SpanStyle::Normal | SpanStyle::BlockQuote) {
+            i += 1;
+            continue;
+        }
+        if let Some(pos) = spans[i].text.find(link_text) {
+            let before = spans[i].text[..pos].to_string();
+            let after = spans[i].text[pos + link_text.len()..].to_string();
+            let orig_style = spans[i].style.clone();
+            let cell_col = spans[i].cell_col;
+            let mut replacement = Vec::new();
+            if !before.is_empty() {
+                replacement.push(StyledSpan { text: before, style: orig_style.clone(), cell_col });
+            }
+            replacement.push(StyledSpan { text: link_text.to_string(), style: SpanStyle::Link(url.to_string()), cell_col });
+            if !after.is_empty() {
+                replacement.push(StyledSpan { text: after, style: orig_style, cell_col });
+            }
+            spans.splice(i..i + 1, replacement);
+            return;
+        }
+        i += 1;
+    }
 }
 
 fn word_wrap(text: &str, width: usize) -> Vec<String> {

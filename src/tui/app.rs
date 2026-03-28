@@ -117,7 +117,7 @@ impl App {
         let status = if is_new {
             Some("New file — describe what to create, then press Enter to generate.".to_string())
         } else {
-            Some("Press ? for help  Space: collapse/expand heading  c: collapse/expand all".to_string())
+            Some("Press ? for help  ←/→ collapse/expand heading  c: collapse/expand all".to_string())
         };
         App {
             config,
@@ -416,26 +416,6 @@ impl App {
         }
     }
 
-    /// Toggle collapse on the currently selected node if it is a heading.
-    pub fn toggle_collapse(&mut self) {
-        if let Some(idx) = self.selected_node {
-            if let Some(node) = self.doc.nodes.get(idx) {
-                if matches!(node.kind, crate::document::NodeKind::Heading { .. }) {
-                    if self.collapsed_sections.contains(&node.anchor) {
-                        self.collapsed_sections.remove(&node.anchor);
-                        self.status_message = Some("Section expanded.".to_string());
-                    } else {
-                        self.collapsed_sections.insert(node.anchor.clone());
-                        self.status_message = Some("Section collapsed.".to_string());
-                    }
-                    self.refresh_display();
-                    return;
-                }
-            }
-        }
-        self.status_message = Some("Select a heading first (↑↓ to navigate).".to_string());
-    }
-
     /// `←` — collapse the selected heading (no-op if not a heading or already collapsed).
     pub fn collapse_heading(&mut self) {
         if let Some(idx) = self.selected_node {
@@ -567,7 +547,7 @@ impl App {
         self.status_message = Some(if n == 0 {
             "No history yet — patches create snapshots automatically.".to_string()
         } else {
-            format!("{} snapshot(s). j/k navigate  Enter restore  q close", n)
+            format!("{} snapshot(s). ↑/↓ navigate  Enter restore  q close", n)
         });
     }
 
@@ -729,6 +709,43 @@ impl App {
         }
     }
 
+    // ── Link activation ──────────────────────────────────────────────────────
+
+    pub fn activate_link(&mut self) {
+        let Some(node_idx) = self.selected_node else {
+            self.status_message = Some("No node selected.".to_string());
+            return;
+        };
+        let url = self.display_lines
+            .iter()
+            .filter(|l| l.node_index == Some(node_idx))
+            .find_map(|l| l.first_link_url.clone());
+        let Some(url) = url else {
+            self.status_message = Some("No link on selected node.".to_string());
+            return;
+        };
+        if url.starts_with('#') {
+            match self.doc.resolve_fragment(&url) {
+                Some(target) => {
+                    self.selected_node = Some(target);
+                    self.selected_line_in_node = None;
+                    self.selected_table_col = None;
+                    self.scroll_to_node(target);
+                    self.status_message = Some(format!("Jumped to '{}'.", url));
+                }
+                None => {
+                    self.status_message = Some(format!("Section '{}' not found.", url));
+                }
+            }
+        } else {
+            let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            match std::process::Command::new(opener).arg(&url).spawn() {
+                Ok(_) => self.status_message = Some(format!("Opening: {}", url)),
+                Err(e) => self.status_message = Some(format!("Cannot open '{}': {}", url, e)),
+            }
+        }
+    }
+
     // ── Remark flow ──────────────────────────────────────────────────────────
 
     pub fn start_search(&mut self) {
@@ -800,18 +817,9 @@ impl App {
         self.status_message = Some("Search closed.".to_string());
     }
 
-    pub fn start_remark(&mut self) {
-        if self.selected_node.is_some() {
-            self.mode = AppMode::RemarkEdit;
-            self.input.clear();
-        } else {
-            self.status_message = Some("Select a node first (↑/↓ to navigate)".to_string());
-        }
-    }
-
     pub fn start_direct_edit(&mut self) {
         let Some(node_idx) = self.selected_node else {
-            self.status_message = Some("Select a block first, then press Ctrl+E.".to_string());
+            self.status_message = Some("Select a block first, then press e.".to_string());
             return;
         };
 
@@ -836,7 +844,7 @@ impl App {
                     return;
                 }
                 _ => {
-                    self.status_message = Some("Navigate to a cell first (←→ to select a column, then Ctrl+E).".to_string());
+                    self.status_message = Some("Navigate to a cell first (←→ to select a column, then e).".to_string());
                     return;
                 }
             }
@@ -1174,7 +1182,7 @@ impl App {
                 list_context,
                 occurrence_anchors,
                 created_at: Utc::now(),
-                status: RemarkStatus::Queued,
+                status: RemarkStatus::Pending,
             };
             self.remarks.add(remark);
             self.input.clear();
@@ -1231,20 +1239,20 @@ impl App {
     // ── AI submission flows ──────────────────────────────────────────────────
 
     pub async fn send_remarks(&mut self) {
-        let queued: Vec<_> = self.remarks.queued().into_iter().cloned().collect();
-        if queued.is_empty() {
-            self.status_message = Some("No queued remarks to send.".to_string());
+        let pending: Vec<_> = self.remarks.pending().into_iter().cloned().collect();
+        if pending.is_empty() {
+            self.status_message = Some("No pending remarks to send.".to_string());
             return;
         }
         self.is_loading = true;
-        let refs: Vec<&Remark> = queued.iter().collect();
+        let refs: Vec<&Remark> = pending.iter().collect();
         let prepared = prompts::build_revision_request(&self.config, &self.doc, &refs);
         self.status_message = Some(match prepared.mode {
             RevisionRequestMode::Targeted => {
-                format!("Sending {} remark(s) with targeted context…", queued.len())
+                format!("Sending {} remark(s) with targeted context…", pending.len())
             }
             RevisionRequestMode::FullDocument => {
-                format!("Sending {} remark(s) with full-document fallback…", queued.len())
+                format!("Sending {} remark(s) with full-document fallback…", pending.len())
             }
         });
 
@@ -1302,7 +1310,7 @@ impl App {
             self.mode = AppMode::ReviewMode;
             self.status_message = if pending > 0 {
                 Some(format!(
-                    "{} pending review item(s). j/k navigate  a answer  y accept  d dismiss  x clear results  q close",
+                    "{} pending review item(s). ↑/↓ navigate  a answer  y accept  d dismiss  x clear results  q close",
                     pending
                 ))
             } else {
@@ -1470,7 +1478,7 @@ impl App {
             list_context: None,
             occurrence_anchors,
             created_at: Utc::now(),
-            status: RemarkStatus::Queued,
+            status: RemarkStatus::Pending,
         };
         self.remarks.add(remark);
 
@@ -1631,7 +1639,7 @@ impl App {
                     self.mode = AppMode::ReviewMode;
                     self.selected_review = Some(0);
                     self.status_message = Some(format!(
-                        "Review found {} issue(s). j/k navigate  a answer  y accept  d dismiss  x clear results",
+                        "Review found {} issue(s). ↑/↓ navigate  a answer  y accept  d dismiss  x clear results",
                         n
                     ));
                 } else {
@@ -1656,7 +1664,7 @@ impl App {
                             self.refresh_display();
                             self.mode = AppMode::Normal;
                             self.status_message = Some(
-                                "Document created and saved! J/K to navigate, r to add remarks."
+                                "Document created and saved! Use ↑/↓ to navigate, r to update matching occurrences."
                                     .to_string(),
                             );
                         }

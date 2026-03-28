@@ -45,16 +45,17 @@ aichitect new-spec.md
 
 | Key | Action |
 |-----|--------|
-| `j`/`k` or `↑`/`↓` | Scroll document |
-| `J`/`K` | Select next/prev node |
+| `↑`/`↓` | Select next/prev node or line |
+| `c` | Collapse or expand all headings |
 | `PgUp`/`PgDn` | Page up/down |
-| `r` | Add remark to selected node |
-| `S` | Send queued remarks to AI |
+| `Home`/`End` | Jump to top/bottom of the document |
+| `e` | Edit the current block locally |
+| `r` | Find all occurrences and write one remark for all of them |
 | `A` | Analyze document for issues |
 | `H` | Browse patch history snapshots |
 | `W` | Save document |
 | `u`/`U` | Undo/Redo |
-| `p` | Toggle remarks panel |
+| `R` | Toggle remarks panel |
 | `?` | Help |
 | `q` | Quit |
 
@@ -70,7 +71,7 @@ When you open a file that does not exist yet, Aichitect asks the model to genera
 
 ### 2. Revision from remarks
 
-When you press `S`, Aichitect now prefers a targeted revision request. It builds local context packs containing:
+When you submit a remark or resolve a review item, Aichitect prefers a targeted revision request. It builds local context packs containing:
 
 - the target anchor and selected text for each remark
 - nearby section / sibling node context
@@ -81,7 +82,7 @@ If the targeted scope grows too large or looks ambiguous, Aichitect falls back t
 
 - an anchor map for the parsed document
 - the full Markdown document
-- the queued remarks
+- the submitted remarks
 - the selected text for each remark
 - related occurrences when the same wording appears elsewhere
 

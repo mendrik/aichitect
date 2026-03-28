@@ -46,7 +46,8 @@ impl std::fmt::Display for ReviewCategory {
 pub enum ReviewStatus {
     New,
     Answered,
-    Queued,
+    #[serde(alias = "queued")]
+    Pending,
     Sent,
     Applied,
     Dismissed,

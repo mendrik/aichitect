@@ -106,6 +106,7 @@ fn span_style_to_ratatui(style: &SpanStyle) -> Style {
         SpanStyle::Number => Style::default().fg(Color::LightYellow),
         SpanStyle::Operator => Style::default().fg(Color::Gray),
         SpanStyle::Bracket => Style::default().fg(Color::LightMagenta),
+        SpanStyle::Link(_) => Style::default().fg(Color::LightBlue).add_modifier(Modifier::UNDERLINED),
     }
 }
 
@@ -136,7 +137,7 @@ fn draw_document(f: &mut Frame, app: &App, area: Rect) {
         format!(" ▶{} collapsed", app.collapsed_sections.len())
     };
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::RIGHT | Borders::BOTTOM)
         .title(format!(" {}{}{} ", fname, collapsed_hint, loading))
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -255,7 +256,7 @@ fn draw_remarks_panel(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app.remarks.remarks.iter().map(|r| {
         let (icon, color) = match r.status {
             crate::remarks::RemarkStatus::Draft => ("○", Color::Gray),
-            crate::remarks::RemarkStatus::Queued => ("◉", Color::Yellow),
+            crate::remarks::RemarkStatus::Pending => ("◉", Color::Yellow),
             crate::remarks::RemarkStatus::Sent => ("⟳", Color::Cyan),
             crate::remarks::RemarkStatus::Applied => ("✓", Color::Green),
             crate::remarks::RemarkStatus::Failed => ("✗", Color::Red),
@@ -314,7 +315,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         .and_then(|i| app.doc.nodes.get(i))
         .map(|n| format!(" [{}]", n.anchor))
         .unwrap_or_default();
-    let qcount = app.remarks.queued().len();
+    let pending_count = app.remarks.pending().len();
     let total = app.remarks.remarks.len();
 
     let left = Span::styled(
@@ -323,7 +324,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     );
     let mid = Span::styled(format!(" {}{} ", msg, node_info), Style::default().fg(Color::White));
     let right = Span::styled(
-        format!(" {}r {}q ", total, qcount),
+        format!(" {}r {}p ", total, pending_count),
         Style::default().fg(Color::DarkGray),
     );
     let bar = Paragraph::new(Line::from(vec![left, mid, right]))
@@ -743,21 +744,19 @@ fn draw_help(f: &mut Frame, size: Rect) {
 
     let help = vec![
         bold("Navigation", Color::Cyan),
-        Line::from("  j/k ↑↓        Scroll document"),
-        Line::from("  J/K           Select next/prev visible node"),
-        Line::from("  Space         Collapse / expand selected heading"),
+        Line::from("  ↑↓            Select next/prev visible node"),
+        Line::from("  ←/→           Collapse/expand heading, or move across table columns"),
         Line::from("  Shift+←/→     Collapse/expand headings below"),
-        Line::from("  Ctrl+E        Edit current block locally"),
+        Line::from("  e             Edit current block locally"),
         Line::from("  PgUp/PgDn     Page up/down"),
-        Line::from("  g / G         Top / bottom"),
+        Line::from("  Home / End    Top / bottom"),
         Line::from("  Esc           Deselect node"),
         Line::from("  Ctrl+F        Search document"),
         Line::from(""),
         bold("Remarks", Color::Yellow),
-        Line::from("  r             Add remark on selected node"),
-        Line::from("  f             Find all occurrences + write remark (updates all)"),
-        Line::from("  S             Send queued remarks to AI"),
+        Line::from("  r             Find all occurrences + write remark (updates all)"),
         Line::from("  R             Toggle remarks panel"),
+        Line::from("  H             Open revision history"),
         Line::from(""),
         bold("In any input field", Color::White),
         Line::from("  ← →           Move cursor"),
@@ -768,10 +767,9 @@ fn draw_help(f: &mut Frame, size: Rect) {
         Line::from(""),
         bold("Review", Color::Magenta),
         Line::from("  A             Analyze document for issues"),
-        Line::from("  j/k           Navigate items"),
+        Line::from("  ↑↓            Navigate items"),
         Line::from("  a             Answer the issue"),
         Line::from("  d             Dismiss item"),
-        Line::from("  S             Send answered items for revision"),
         Line::from(""),
         bold("Document", Color::Green),
         Line::from("  W             Save"),
@@ -841,7 +839,7 @@ fn draw_history_browser(f: &mut Frame, app: &App, size: Rect) {
 
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" Revision History  (j/k navigate  Enter restore  q close) ")
+        .title(" Revision History  (↑/↓ navigate  Enter restore  q close) ")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = outer.inner(area);
     f.render_widget(outer, area);
