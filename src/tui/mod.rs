@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::document::Document;
+use crate::watcher;
 use app::{App, AppEvent};
 
 pub async fn run(config: Config, doc: Document) -> Result<()> {
@@ -34,6 +35,14 @@ pub async fn run(config: Config, doc: Document) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(64);
+
+    // Start file watcher for external changes.
+    let _watcher_handle = if doc.path.exists() {
+        watcher::spawn_file_watcher(doc.path.clone(), event_tx.clone()).ok()
+    } else {
+        None
+    };
+
     let mut app = App::new(config, doc, event_tx.clone())?;
 
     loop {

@@ -32,9 +32,16 @@ pub struct ResponseTextConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponsePayload {
     pub id: String,
     pub text: String,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Clone)]
@@ -141,7 +148,14 @@ fn parse_response_payload(json: &Value) -> Result<ResponsePayload> {
         anyhow::bail!("No text content in response: {}", json);
     }
 
-    Ok(ResponsePayload { id, text })
+    let usage = json.get("usage").and_then(|u| {
+        Some(TokenUsage {
+            input_tokens: u["input_tokens"].as_u64()?,
+            output_tokens: u["output_tokens"].as_u64()?,
+        })
+    });
+
+    Ok(ResponsePayload { id, text, usage })
 }
 
 #[cfg(test)]

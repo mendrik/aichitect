@@ -10,6 +10,7 @@ mod remarks;
 mod revision_context;
 mod review;
 mod tui;
+mod watcher;
 
 use config::Config;
 use document::Document;

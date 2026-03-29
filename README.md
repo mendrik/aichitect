@@ -46,48 +46,93 @@ aichitect new-spec.md
 
 | Key | Action |
 |-----|--------|
-| `↑`/`↓` | Select next/prev node or line |
+| `Up`/`Down` | Select next/prev node or line |
+| `Left` | Collapse heading / previous table column |
+| `Right` | Expand heading / next table column |
+| `Shift+Left` | Collapse all headings below cursor |
+| `Shift+Right` | Expand all headings below cursor |
 | `c` | Collapse or expand all headings |
 | `PgUp`/`PgDn` | Page up/down |
 | `Home`/`End` | Jump to top/bottom of the document |
 | `e` | Edit the current block locally |
 | `r` | Write a remark for the current selection |
+| `R` | Toggle remarks side panel |
 | `Shift+A` | Analyze document for issues |
 | `H` | Browse patch history snapshots |
 | `W` | Save document |
 | `u`/`U` | Undo/Redo |
-| `R` | Toggle remarks panel |
-| `?` | Help |
+| `Ctrl+F` | Search within document |
+| `Ctrl+C` | Copy current selection to clipboard |
+| `Enter` | Follow link on selected node |
+| `?` | Help overlay |
 | `q` | Quit |
 
-## How the AI calls work
+## Architecture
 
-Aichitect sends all AI traffic through OpenAI's `POST /responses` API. Authentication uses your `api_key`, and `organization`, `project`, and `base_url` are added when configured.
+### Project Structure
 
-Each document keeps lightweight OpenAI session state on disk so analysis turns and patch turns can chain with `previous_response_id` while the Markdown file in Aichitect remains the canonical source of truth.
+```
+src/
+  main.rs              CLI entry point, config + document loading
+  config/mod.rs        TOML configuration management
+  document/
+    mod.rs             Markdown parsing, rendering, patch application, undo/redo
+    patch.rs           PatchOp enum and tests
+    highlight.rs       Per-line syntax highlighting for 20+ languages
+  openai/
+    mod.rs             Module re-exports
+    client.rs          OpenAI Responses API client
+    session.rs         Per-document session state persistence
+    prompts.rs         System prompts, request builders, response parsers
+  remarks/mod.rs       Remark data model and store
+  review/mod.rs        Review item model, categories, and store
+  revision_context.rs  Targeted revision context builder
+  history/mod.rs       On-disk revision history snapshots
+  watcher.rs           File watcher for external changes (notify)
+  tui/
+    mod.rs             Terminal setup, event loop
+    app.rs             Application state and business logic
+    events.rs          Keyboard, mouse, and paste event handlers
+    input.rs           Text input buffer with cursor and paste regions
+    ui.rs              TUI rendering with Ratatui
+```
 
-There are three AI flows:
+### Data Flow
 
-### 1. Document creation
+```
+User Input
+    |
+    v
+events.rs          Keyboard/mouse/paste dispatch
+    |
+    v
+app.rs             State mutation + async AI requests
+    |
+    +--> document/mod.rs    Parsing, rendering, patching
+    +--> openai/prompts.rs  Build request payloads
+    +--> openai/client.rs   HTTP to OpenAI Responses API
+    |
+    v
+AppEvent channel   Async results (patches, reviews, creation)
+    |
+    v
+app.rs             Apply patches, save, refresh display
+    |
+    v
+ui.rs              Render to terminal via Ratatui
+```
 
-When you open a file that does not exist yet, Aichitect asks the model to generate raw Markdown. This flow expects plain Markdown back, not JSON, and the returned text becomes the entire document.
+### Document Model
 
-### 2. Revision from remarks
+The document is parsed from Markdown into a flat list of `DocNode` values. Each node gets a stable anchor ID (e.g. `h2-quick-start`, `p-0`, `cb-rust-1`, `li-3`) used to target AI patches.
 
-When you submit a remark or accept/customize a review item, Aichitect sends one patch request at a time. Each request prefers a targeted revision context pack containing:
+Node types: `Heading`, `Paragraph`, `CodeBlock`, `ListItem`, `BlockQuote`, `Table`, `HorizontalRule`, `Html`.
 
-- the target anchor and selected text for each remark
-- nearby section / sibling node context
-- list or code-line context when relevant
+The rendering pipeline converts nodes into `StyledLine` values with inline formatting (bold, italic, code, links), syntax highlighting for code blocks, and column-aware table rendering.
 
-If the targeted scope grows too large or looks ambiguous, Aichitect falls back to the older full-document request that includes:
+### Anchor-Based Patching
 
-- an anchor map for the parsed document
-- the full Markdown document
-- the submitted remark
-- the selected text for that remark
-
-Patch generation uses the smaller `model_fix` model and requires a structured JSON response:
+AI replies don't rewrite the whole file. They return JSON patch operations targeting specific anchors:
 
 ```json
 {
@@ -95,51 +140,91 @@ Patch generation uses the smaller `model_fix` model and requires a structured JS
     {
       "op": "replace_section",
       "anchor": "p-0",
-      "content": "...",
-      "rationale": "..."
+      "content": "Updated paragraph text.\n",
+      "rationale": "Clarify requirements"
     }
   ]
 }
 ```
 
-Supported patch operations include replacing sections or code blocks, inserting before/after a node, deleting a block, updating heading text, and updating list items.
+Supported operations: `replace_section`, `replace_text_span`, `replace_code_block`, `insert_after`, `insert_before`, `delete_block`, `update_heading_text`, `update_list_item`.
 
-### 3. Review / issue finding
+Patches are applied from end-to-start to preserve byte offsets. A content snapshot taken before the request enables fingerprint-based fallback when anchors shift during concurrent editing.
 
-When you press `Shift+A`, Aichitect sends the full document plus anchor map to the stronger `model` and asks for structured review findings. The reply must be JSON with an `issues` array. Each issue points at an anchor, includes evidence from the document, explains why it matters, and suggests a concrete resolution.
+### Save and History Guarantees
 
-Those review items form a queue you can work down in the TUI. Each item can be accepted as-is or customized, after which it is converted into a localized patch request and sent back through the patch flow above.
+Every document mutation (AI patch, direct edit, document creation) saves the file to disk and writes a history snapshot to `~/.aichitect/history/<stem>/<timestamp>.md`. The undo stack only captures state when patches actually apply, preventing phantom undo entries.
 
-## How replies patch the document
+## How the AI Calls Work
 
-The document is parsed into anchored nodes such as headings, paragraphs, list items, block quotes, and code blocks. AI replies do not directly rewrite the whole file. Instead, they return patch operations that target specific anchors.
+Aichitect sends all AI traffic through OpenAI's `POST /responses` API. Authentication uses your `api_key`, and `organization`, `project`, and `base_url` are added when configured.
 
-Before sending a revision request, Aichitect captures a per-anchor content snapshot. When the reply comes back, each patch is only applied if the current content at that anchor still matches the snapshot from request time. If the document changed in the meantime, that patch is skipped instead of blindly overwriting newer edits.
+Each document keeps lightweight OpenAI session state on disk (`~/.aichitect/sessions/`) so analysis turns and patch turns can chain with `previous_response_id` while the Markdown file in Aichitect remains the canonical source of truth.
 
-Patches are applied from the end of the file toward the beginning so byte offsets stay valid while edits are being inserted or replaced. After patching, the document is reparsed and the anchor map is rebuilt.
+There are three AI flows:
 
-If at least one patch applied successfully, Aichitect also writes a snapshot to:
+### 1. Document Creation
 
-```text
-~/.aichitect/history/<document-stem>/<timestamp>.md
-```
+When you open a file that does not exist yet, Aichitect asks the model to generate raw Markdown. This flow expects plain Markdown back, not JSON, and the returned text becomes the entire document.
 
-That history is what the `H` browser shows, and it gives you an on-disk trail of AI-produced revisions. Applied patch changes are now also saved to the working document immediately after they succeed.
+### 2. Revision from Remarks
+
+When you submit a remark or accept/customize a review item, Aichitect sends one patch request at a time. Each request prefers a targeted revision context pack containing:
+
+- the target anchor and selected text for each remark
+- nearby section / sibling node context
+- list or code-line context when relevant
+
+If the targeted scope grows too large (>14k chars or >24 targets) or if there are more than 6 remarks, Aichitect falls back to a full-document request that includes the complete anchor map, full Markdown, and all submitted remarks.
+
+Patch generation uses the smaller `model_fix` model with structured JSON output via OpenAI's JSON schema enforcement.
+
+### 3. Review / Issue Finding
+
+When you press `Shift+A`, Aichitect sends the full document plus anchor map to the stronger `model` and asks for structured review findings. The reply must be JSON with an `issues` array. Each issue targets an anchor, includes evidence from the document, explains why it matters, and suggests a concrete resolution.
+
+Review categories: Ambiguity, Contradiction, Missing Acceptance Criteria, Undefined Term, Hidden Assumption, Missing Edge Case, Missing Operational Constraint, Unclear Ownership, Vague Success Metric, Missing Failure Behavior, Misleading Wording, Incomplete Code Example, Unspecified Input/Output.
 
 ## Review Mode
 
 Press `Shift+A` to run the AI review pass. In review mode:
 
-- `↑`/`↓` - navigate issues
+- `Up`/`Down` - navigate issues
 - `a` - answer the suggested question for an issue
 - `y` - accept the suggested resolution
 - `d` - dismiss an issue
 - `x` - clear cached analysis results
 - `q`/`Esc` - exit review mode
 
-## CLI flags
+## History Browser
+
+Press `H` to open the history browser. Snapshots are automatically created after every document mutation (patches, direct edits, creation). Use `Up`/`Down` to browse, `Enter` to restore a snapshot, `q` to close.
+
+History lives at `~/.aichitect/history/<document-stem>/`.
+
+## CLI Flags
 
 ```bash
 aichitect --init              # write sample config
 aichitect --anchors file.md   # print anchor map and exit
 ```
+
+## File Watcher
+
+Aichitect watches the open document for external changes. When another editor or tool modifies the file on disk, Aichitect detects it within 500ms, merges the new content into the active session, and resets the AI session context so subsequent requests see the updated state.
+
+During an active AI request the merge is deferred to avoid conflicts with in-flight patches.
+
+## Dependencies
+
+- **TUI**: ratatui + crossterm
+- **Async**: tokio (multi-threaded runtime)
+- **HTTP**: reqwest with JSON
+- **Markdown**: pulldown-cmark
+- **Data**: serde, serde_json, toml, uuid, chrono
+- **File watching**: notify + notify-debouncer-mini
+- **System**: arboard (clipboard), dirs, clap
+
+## License
+
+MIT

@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::document::{truncate_chars, AnchorId, Document, PatchOp, StyledLine};
-use crate::openai::client::{OpenAiClient, ResponsePayload, ResponseRequest};
+use crate::openai::client::{OpenAiClient, ResponsePayload, ResponseRequest, TokenUsage};
 use crate::openai::prompts;
 use crate::openai::session::DocumentSessionStore;
 use crate::remarks::{Remark, RemarkStatus, RemarkStore, TargetType};
@@ -12,6 +12,7 @@ use chrono::Utc;
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -37,13 +38,13 @@ pub enum AppMode {
     Help,
 }
 
-#[allow(dead_code)]
 pub enum AppEvent {
     PatchReceived {
         remark_id: Uuid,
         patches: Vec<PatchOp>,
         snapshot: HashMap<AnchorId, crate::document::BlockFingerprint>,
         response_id: String,
+        usage: Option<TokenUsage>,
     },
     PatchFailed {
         remark_id: Uuid,
@@ -52,14 +53,18 @@ pub enum AppEvent {
     ReviewReceived {
         items: Vec<ReviewItem>,
         response_id: String,
+        usage: Option<TokenUsage>,
     },
     AnalysisFailed(String),
     DocumentCreated {
         content: String,
         response_id: String,
+        usage: Option<TokenUsage>,
     },
     CreationFailed(String),
     StatusMessage(String),
+    /// The file was modified externally on disk.
+    ExternalFileChanged(String),
 }
 
 pub struct App {
@@ -105,9 +110,9 @@ pub struct App {
     pub selected_search_hit: Option<usize>,
     /// Incremented every event-loop tick; drives spinner + gradient animations.
     pub spinner_tick: u64,
-    /// Label + chars received so far during a long-running request. `None` when
+    /// Label + start time of a long-running request. `None` when
     /// no request-progress overlay should be shown.
-    pub request_progress: Option<(String, usize)>,
+    pub request_progress: Option<(String, Instant)>,
     /// True when the user asked to see review results as soon as background
     /// analysis finishes.
     pub open_review_when_ready: bool,
@@ -136,11 +141,24 @@ impl App {
             )
         };
         let session_store = DocumentSessionStore::for_doc(&doc.path)?;
+
+        // Restore the most recent analysis results, if any.
+        let mut review_store = ReviewStore::new();
+        if !is_new {
+            if let Ok(store) = crate::review::AnalysisStore::for_doc(&doc.path) {
+                if let Some(items) = store.load_latest() {
+                    for item in items {
+                        review_store.add(item);
+                    }
+                }
+            }
+        }
+
         Ok(App {
             config,
             doc,
             remarks: RemarkStore::new(),
-            review_store: ReviewStore::new(),
+            review_store,
             mode,
             session_store,
             scroll_offset: 0,
@@ -178,11 +196,18 @@ impl App {
     }
 
     fn start_request_progress(&mut self, label: impl Into<String>) {
-        self.request_progress = Some((label.into(), 0));
+        self.request_progress = Some((label.into(), Instant::now()));
     }
 
     fn clear_request_progress(&mut self) {
         self.request_progress = None;
+    }
+
+    fn format_usage(usage: &Option<TokenUsage>) -> String {
+        match usage {
+            Some(u) => format!(" [{}in + {}out tokens]", u.input_tokens, u.output_tokens),
+            None => String::new(),
+        }
     }
 
     fn begin_request(&mut self) {
@@ -365,10 +390,10 @@ impl App {
                 visible[(pos + 1).min(visible.len() - 1)]
             }
         };
-        if self.is_code_block(next) && self.code_block_line_count(next) > 0 {
-            self.selected_line_in_node = Some(0);
-            self.selected_table_col = None;
-        } else if self.is_table(next) && self.table_row_count(next) > 0 {
+        let has_inner_lines =
+            (self.is_code_block(next) && self.code_block_line_count(next) > 0)
+            || (self.is_table(next) && self.table_row_count(next) > 0);
+        if has_inner_lines {
             self.selected_line_in_node = Some(0);
             self.selected_table_col = None;
         } else {
@@ -415,13 +440,15 @@ impl App {
                 visible[pos.saturating_sub(1)]
             }
         };
-        if self.is_code_block(prev) {
-            let count = self.code_block_line_count(prev);
-            self.selected_line_in_node = if count > 0 { Some(count - 1) } else { None };
-            self.selected_table_col = None;
+        let inner_count = if self.is_code_block(prev) {
+            self.code_block_line_count(prev)
         } else if self.is_table(prev) {
-            let count = self.table_row_count(prev);
-            self.selected_line_in_node = if count > 0 { Some(count - 1) } else { None };
+            self.table_row_count(prev)
+        } else {
+            0
+        };
+        if inner_count > 0 {
+            self.selected_line_in_node = Some(inner_count - 1);
             self.selected_table_col = None;
         } else {
             self.selected_line_in_node = None;
@@ -437,36 +464,28 @@ impl App {
 
     /// `←` — collapse the selected heading (no-op if not a heading or already collapsed).
     pub fn collapse_heading(&mut self) {
-        if let Some(idx) = self.selected_node {
-            if let Some(node) = self.doc.nodes.get(idx) {
-                if matches!(node.kind, crate::document::NodeKind::Heading { .. }) {
-                    if !self.collapsed_sections.contains(&node.anchor) {
-                        self.collapsed_sections.insert(node.anchor.clone());
-                        self.refresh_display();
-                        self.status_message = Some("Section collapsed. → to expand.".to_string());
-                    }
-                    return;
-                }
-            }
+        let Some(idx) = self.selected_node else { return };
+        let Some(node) = self.doc.nodes.get(idx) else { return };
+        if matches!(node.kind, crate::document::NodeKind::Heading { .. })
+            && !self.collapsed_sections.contains(&node.anchor)
+        {
+            self.collapsed_sections.insert(node.anchor.clone());
+            self.refresh_display();
+            self.status_message = Some("Section collapsed. → to expand.".to_string());
         }
-        // Not on a heading — scroll left does nothing special.
     }
 
     /// `→` — expand the selected heading (no-op if not a heading or already expanded).
     pub fn expand_heading(&mut self) {
-        if let Some(idx) = self.selected_node {
-            if let Some(node) = self.doc.nodes.get(idx) {
-                if matches!(node.kind, crate::document::NodeKind::Heading { .. }) {
-                    if self.collapsed_sections.contains(&node.anchor) {
-                        self.collapsed_sections.remove(&node.anchor);
-                        self.refresh_display();
-                        self.status_message = Some("Section expanded.".to_string());
-                    }
-                    return;
-                }
-            }
+        let Some(idx) = self.selected_node else { return };
+        let Some(node) = self.doc.nodes.get(idx) else { return };
+        if matches!(node.kind, crate::document::NodeKind::Heading { .. })
+            && self.collapsed_sections.contains(&node.anchor)
+        {
+            self.collapsed_sections.remove(&node.anchor);
+            self.refresh_display();
+            self.status_message = Some("Section expanded.".to_string());
         }
-        // Not on a heading — scroll right does nothing special.
     }
 
     /// Collapse all headings from the selected heading downward, including the
@@ -695,11 +714,9 @@ impl App {
             }
         } else if let Some(&node_idx) = self.doc.anchor_map.get(anchor) {
             self.selected_node = Some(node_idx);
-            if self.is_code_block(node_idx) && self.code_block_line_count(node_idx) > 0 {
-                self.selected_line_in_node = Some(0);
-                self.selected_table_col = None;
-                self.scroll_to_code_line(node_idx, 0);
-            } else if self.is_table(node_idx) && self.table_row_count(node_idx) > 0 {
+            let has_inner = (self.is_code_block(node_idx) && self.code_block_line_count(node_idx) > 0)
+                || (self.is_table(node_idx) && self.table_row_count(node_idx) > 0);
+            if has_inner {
                 self.selected_line_in_node = Some(0);
                 self.selected_table_col = None;
                 self.scroll_to_code_line(node_idx, 0);
@@ -983,7 +1000,7 @@ impl App {
                         self.input.clear();
                         self.direct_edit_anchor = None;
                         self.mode = AppMode::Normal;
-                        if let Err(e) = self.doc.save() {
+                        if let Err(e) = self.doc.save_with_history() {
                             self.status_message =
                                 Some(format!("Saved in memory, write failed: {}", e));
                         } else if skipped.is_empty() {
@@ -1105,7 +1122,7 @@ impl App {
                 self.input.clear();
                 self.direct_edit_anchor = None;
                 self.mode = AppMode::Normal;
-                if let Err(e) = self.doc.save() {
+                if let Err(e) = self.doc.save_with_history() {
                     self.status_message =
                         Some(format!("Saved edit in memory, but write failed: {}", e));
                 } else if skipped.is_empty() {
@@ -1343,6 +1360,7 @@ impl App {
                                 patches,
                                 snapshot,
                                 response_id: payload.id,
+                                usage: payload.usage,
                             })
                             .await;
                     }
@@ -1434,6 +1452,7 @@ impl App {
                             .send(AppEvent::ReviewReceived {
                                 items,
                                 response_id: payload.id,
+                                usage: payload.usage,
                             })
                             .await;
                     }
@@ -1472,6 +1491,7 @@ impl App {
                         .send(AppEvent::DocumentCreated {
                             content: payload.text,
                             response_id: payload.id,
+                            usage: payload.usage,
                         })
                         .await;
                 }
@@ -1633,6 +1653,7 @@ impl App {
                 patches,
                 snapshot,
                 response_id,
+                usage,
             } => {
                 self.finish_request();
                 self.search_hits.clear();
@@ -1670,31 +1691,35 @@ impl App {
                             .err()
                             .map(|e| format!(" Session state was not saved: {}", e))
                             .unwrap_or_default();
-                        if let Err(e) = self.doc.save() {
-                            self.status_message =
-                                Some(format!("Autosave failed: {}{}", e, session_warning));
-                        } else if applied.is_empty() {
+                        let tok = Self::format_usage(&usage);
+                        if applied.is_empty() {
                             self.status_message = Some(format!(
-                                "No patches applied for this remark; {} target(s) were stale.{}",
+                                "No patches applied for this remark; {} target(s) were stale.{}{}",
                                 skipped.len(),
+                                tok,
                                 session_warning
                             ));
+                        } else if let Err(e) = self.doc.save_with_history() {
+                            self.status_message =
+                                Some(format!("Autosave failed: {}{}", e, session_warning));
                         } else if skipped.is_empty() {
                             self.status_message = Some(format!(
-                                "Applied {} patch(es) and saved.{}",
+                                "Applied {} patch(es) and saved.{}{}",
                                 applied.len(),
+                                tok,
                                 session_warning
                             ));
                         } else {
                             self.status_message = Some(format!(
-                                "Applied {} patch(es), skipped {} (document changed since request), and saved.{}",
+                                "Applied {} patch(es), skipped {} (document changed since request), and saved.{}{}",
                                 applied.len(),
                                 skipped.len(),
+                                tok,
                                 session_warning
                             ));
                         }
 
-                        if self.remarks.pending().len() > 0 {
+                        if !self.remarks.pending().is_empty() {
                             self.status_message = Some(format!(
                                 "{} Sending next queued remark…",
                                 self.status_message.as_deref().unwrap_or("Done.")
@@ -1723,7 +1748,11 @@ impl App {
                 }
                 self.status_message = Some(format!("Patch request failed: {}", message));
             }
-            AppEvent::ReviewReceived { items, response_id } => {
+            AppEvent::ReviewReceived {
+                items,
+                response_id,
+                usage,
+            } => {
                 self.finish_request();
                 self.clear_request_progress();
                 let should_open_review =
@@ -1734,32 +1763,46 @@ impl App {
                 for item in items {
                     self.review_store.add(item);
                 }
+                // Persist analysis results to disk.
+                let analysis_note = if n > 0 {
+                    match crate::review::AnalysisStore::for_doc(&self.doc.path)
+                        .and_then(|store| store.save(&self.review_store.items))
+                    {
+                        Ok(path) => format!(" Saved → {}", path.display()),
+                        Err(e) => format!(" Analysis snapshot not saved: {}", e),
+                    }
+                } else {
+                    String::new()
+                };
                 let session_warning = self
                     .session_store
                     .set_analysis_previous_response_id(Some(response_id))
                     .err()
                     .map(|e| format!(" Session state was not saved: {}", e))
                     .unwrap_or_default();
+                let tok = Self::format_usage(&usage);
                 if n == 0 {
                     self.status_message = Some(format!(
-                        "Analysis complete — no issues found.{}",
-                        session_warning
+                        "Analysis complete — no issues found.{}{}",
+                        tok, session_warning
                     ));
                 } else if should_open_review {
                     self.mode = AppMode::ReviewMode;
                     self.selected_review = Some(0);
                     self.status_message = Some(format!(
-                        "Review found {} issue(s). ↑/↓ navigate  a answer  y accept  d dismiss  x clear results{}",
+                        "Review found {} issue(s). ↑/↓ navigate  a answer  y accept  d dismiss  x clear results{}{}{}",
                         n,
-                        session_warning
+                        tok,
+                        session_warning,
+                        analysis_note
                     ));
                 } else {
                     if self.selected_review.is_none() {
                         self.selected_review = Some(0);
                     }
                     self.status_message = Some(format!(
-                        "Analysis found {} issue(s). Press Shift+A to open review.{}",
-                        n, session_warning
+                        "Analysis found {} issue(s). Press Shift+A to open review.{}{}{}",
+                        n, tok, session_warning, analysis_note
                     ));
                 }
             }
@@ -1772,13 +1815,14 @@ impl App {
             AppEvent::DocumentCreated {
                 content,
                 response_id,
+                usage,
             } => {
                 self.finish_request();
                 self.clear_request_progress();
                 self.search_hits.clear();
                 self.selected_search_hit = None;
                 match self.doc.set_content(content) {
-                    Ok(()) => match self.doc.save() {
+                    Ok(()) => match self.doc.save_with_history() {
                         Ok(()) => {
                             let session_warning = self
                                 .session_store
@@ -1786,12 +1830,14 @@ impl App {
                                 .err()
                                 .map(|e| format!(" Session state was not saved: {}", e))
                                 .unwrap_or_default();
+                            let tok = Self::format_usage(&usage);
                             self.input.clear();
                             self.refresh_display();
                             self.mode = AppMode::Normal;
                             self.status_message = Some(
                                 format!(
-                                    "Document created and saved! Use ↑/↓ to navigate, r to add a remark.{}",
+                                    "Document created and saved! Use ↑/↓ to navigate, r to add a remark.{}{}",
+                                    tok,
                                     session_warning
                                 ),
                             );
@@ -1812,6 +1858,32 @@ impl App {
             }
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);
+            }
+            AppEvent::ExternalFileChanged(new_content) => {
+                // Skip merge if a request is in flight to avoid conflicts.
+                if self.is_loading {
+                    return;
+                }
+                let changed = self.doc.merge_external(&new_content);
+                if changed > 0 {
+                    self.refresh_display();
+                    // Update the session context so subsequent AI requests
+                    // see the externally modified document state.
+                    if let Err(e) = self
+                        .session_store
+                        .set_patch_previous_response_id(None)
+                    {
+                        self.status_message = Some(format!(
+                            "External change merged ({} node(s)), but session reset failed: {}",
+                            changed, e
+                        ));
+                    } else {
+                        self.status_message = Some(format!(
+                            "External change detected — merged {} node(s). Session context reset.",
+                            changed
+                        ));
+                    }
+                }
             }
         }
     }

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod patch;
 pub mod highlight;
 pub use patch::PatchOp;
@@ -20,6 +19,7 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[derive(Debug, Clone)]
 pub struct BlockFingerprint {
     pub hash: u64,
+    #[allow(dead_code)]
     pub raw: String,
 }
 
@@ -64,6 +64,7 @@ pub enum NodeKind {
 
 #[derive(Debug, Clone)]
 pub struct StyledLine {
+    #[allow(dead_code)]
     pub text: String,
     pub spans: Vec<StyledSpan>,
     pub anchor: Option<AnchorId>,
@@ -82,6 +83,7 @@ pub struct StyledSpan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum SpanStyle {
     Normal,
     Bold,
@@ -146,6 +148,56 @@ impl Document {
         self.nodes = Self::parse(&self.raw);
         self.anchor_map = Self::build_anchor_map(&self.nodes);
         Ok(())
+    }
+
+    /// Merge external file changes into the current document.
+    ///
+    /// Compares the new content node-by-node against the current state.
+    /// Nodes that match an existing anchor by content fingerprint are kept
+    /// in-place. New or changed nodes from the external version are spliced
+    /// in, preserving the user's undo history.
+    ///
+    /// Returns the number of nodes that were updated.
+    pub fn merge_external(&mut self, new_raw: &str) -> usize {
+        if new_raw == self.raw {
+            return 0;
+        }
+
+        let new_nodes = Self::parse(new_raw);
+        if new_nodes.is_empty() {
+            return 0;
+        }
+
+        // Build fingerprint sets for both versions.
+        let old_fps: HashMap<AnchorId, u64> = self.nodes.iter().map(|n| {
+            let raw = &self.raw[n.source_start..n.source_end];
+            (n.anchor.clone(), BlockFingerprint::from_raw(raw).hash)
+        }).collect();
+
+        let new_fps: HashMap<AnchorId, u64> = new_nodes.iter().map(|n| {
+            let raw = &new_raw[n.source_start..n.source_end];
+            (n.anchor.clone(), BlockFingerprint::from_raw(raw).hash)
+        }).collect();
+
+        // Count how many anchors have different content.
+        let changed = new_fps.iter().filter(|(anchor, hash)| {
+            old_fps.get(anchor.as_str()) != Some(hash)
+        }).count();
+
+        // Also count anchors that were removed.
+        let removed = old_fps.keys().filter(|a| !new_fps.contains_key(a.as_str())).count();
+
+        let total_changes = changed + removed;
+        if total_changes == 0 {
+            return 0;
+        }
+
+        self.push_undo();
+        self.raw = new_raw.to_string();
+        self.nodes = new_nodes;
+        self.anchor_map = Self::build_anchor_map(&self.nodes);
+
+        total_changes
     }
 
     pub fn parse(raw: &str) -> Vec<DocNode> {
@@ -414,8 +466,6 @@ impl Document {
         patches: Vec<PatchOp>,
         expected_content: Option<&HashMap<AnchorId, BlockFingerprint>>,
     ) -> Result<(Vec<String>, Vec<String>)> {
-        self.push_undo();
-
         let mut applied = Vec::new();
         let mut skipped = Vec::new();
         let mut ops_with_pos: Vec<(usize, usize, PatchOp)> = Vec::new();
@@ -429,7 +479,6 @@ impl Document {
                 let node = &self.nodes[idx];
                 Some((node.source_start, node.source_end))
             } else if let Some(snapshot) = expected_content {
-                // Anchor gone — try to locate the original block by fingerprint
                 snapshot.get(&anchor).and_then(|fp| {
                     fp_index.as_ref()
                         .and_then(|idx_map| idx_map.get(&fp.hash))
@@ -445,6 +494,13 @@ impl Document {
                 skipped.push(anchor);
             }
         }
+
+        if ops_with_pos.is_empty() {
+            return Ok((applied, skipped));
+        }
+
+        // Only snapshot undo state when we actually have patches to apply.
+        self.push_undo();
 
         ops_with_pos.sort_by(|a, b| b.0.cmp(&a.0));
 
@@ -489,14 +545,17 @@ impl Document {
         self.nodes = Self::parse(&self.raw);
         self.anchor_map = Self::build_anchor_map(&self.nodes);
 
-        // Save a snapshot to ~/.aichitect/history/
-        if !applied.is_empty() {
-            if let Ok(store) = crate::history::HistoryStore::for_doc(&self.path) {
-                let _ = store.save_snapshot(&self.raw);
-            }
-        }
-
         Ok((applied, skipped))
+    }
+
+    /// Save the document to disk and write a history snapshot.
+    /// Call this after any mutation (patches, direct edits, creation).
+    pub fn save_with_history(&self) -> Result<()> {
+        self.save()?;
+        if let Ok(store) = crate::history::HistoryStore::for_doc(&self.path) {
+            let _ = store.save_snapshot(&self.raw);
+        }
+        Ok(())
     }
 
     pub fn render_display(&self, width: usize, collapsed: &HashSet<AnchorId>) -> Vec<StyledLine> {
@@ -932,8 +991,7 @@ fn slugify(text: &str, max_len: usize) -> String {
             last_dash = false;
         }
     }
-    let trimmed = result[..result.len().min(max_len)].trim_end_matches('-').to_string();
-    trimmed
+    result[..result.len().min(max_len)].trim_end_matches('-').to_string()
 }
 
 fn unique_anchor(prefix: &str, counters: &mut HashMap<String, usize>) -> String {
@@ -1104,11 +1162,9 @@ fn github_slug(text: &str) -> String {
         if c.is_alphanumeric() {
             result.push(c.to_lowercase().next().unwrap_or(c));
             last_hyphen = false;
-        } else if (c == '-' || c == ' ') && !result.is_empty() {
-            if !last_hyphen {
-                result.push('-');
-                last_hyphen = true;
-            }
+        } else if (c == '-' || c == ' ') && !result.is_empty() && !last_hyphen {
+            result.push('-');
+            last_hyphen = true;
         }
         // all other punctuation is dropped
     }
@@ -1120,8 +1176,7 @@ fn github_slug(text: &str) -> String {
 fn extract_links(raw: &str) -> Vec<(String, String)> {
     let mut links = Vec::new();
     let mut remaining = raw;
-    loop {
-        let Some(open) = remaining.find('[') else { break };
+    while let Some(open) = remaining.find('[') {
         let after_open = &remaining[open + 1..];
         if let Some(close_bracket) = after_open.find("](") {
             let link_text = &after_open[..close_bracket];

@@ -3,18 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorMode {
+    #[default]
     Auto,
     Always,
     Never,
-}
-
-impl Default for ColorMode {
-    fn default() -> Self {
-        ColorMode::Auto
-    }
 }
 
 /// Raw TOML shape — every tunable is `Option<T>` so we can distinguish
@@ -43,7 +38,6 @@ struct RawConfig {
 /// explicitly configured.  Everything else has a concrete default for
 /// internal use.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Config {
     pub api_key: String,
     pub model: String,
@@ -56,9 +50,13 @@ pub struct Config {
     /// `None` → field not present in config.toml → not sent to the API.
     pub max_tokens: Option<u32>,
     /// `None` → not set → default `false` (non-streaming non-breaking fallback).
+    #[allow(dead_code)]
     pub streaming: bool,
+    #[allow(dead_code)]
     pub color_mode: ColorMode,
+    #[allow(dead_code)]
     pub autosave: bool,
+    #[allow(dead_code)]
     pub autosave_interval_secs: u64,
     pub system_prompt_override: Option<String>,
 }

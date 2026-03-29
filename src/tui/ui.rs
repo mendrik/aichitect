@@ -730,13 +730,13 @@ fn draw_review_panel(f: &mut Frame, app: &App, size: Rect) {
 // ── Request progress ──────────────────────────────────────────────────────────
 
 fn draw_request_progress_bar(f: &mut Frame, app: &App, area: Rect) {
-    let Some((label, chars)) = &app.request_progress else {
+    let Some((label, started)) = &app.request_progress else {
         return;
     };
 
     let spinner = spinner_frame(app.spinner_tick);
-    let approx_tokens = chars / 4;
-    let prefix = format!(" {} {} ~{} tok ", spinner, label, approx_tokens);
+    let elapsed = started.elapsed().as_secs();
+    let prefix = format!(" {} {} {}s ", spinner, label, elapsed);
     let bar_width = area.width.saturating_sub(prefix.chars().count() as u16 + 2) as usize;
 
     let mut spans = vec![Span::styled(
@@ -791,7 +791,7 @@ fn draw_request_progress_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_request_overlay(f: &mut Frame, app: &App, size: Rect) {
-    let Some((label, chars)) = &app.request_progress else {
+    let Some((label, started_at)) = &app.request_progress else {
         return;
     };
     let area = centered_rect(44, 7, size);
@@ -827,7 +827,7 @@ fn draw_request_overlay(f: &mut Frame, app: &App, size: Rect) {
         })
         .collect();
 
-    let approx_tokens = chars / 4;
+    let elapsed_secs = started_at.elapsed().as_secs();
     let spinner = spinner_frame(app.spinner_tick);
 
     let chunks = Layout::default()
@@ -847,7 +847,7 @@ fn draw_request_overlay(f: &mut Frame, app: &App, size: Rect) {
         Paragraph::new(Line::from(vec![
             Span::styled(format!("{} ", spinner), Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!("~{} tokens received", approx_tokens),
+                format!("{}s elapsed", elapsed_secs),
                 Style::default().fg(Color::DarkGray),
             ),
         ]))

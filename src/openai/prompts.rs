@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -313,8 +313,7 @@ pub fn build_creation_request(
 }
 
 pub fn parse_revision_response(raw: &str) -> Result<Vec<PatchOp>> {
-    let envelope: PatchEnvelope =
-        serde_json::from_str(raw).context("Failed to parse patch response JSON")?;
+    let envelope: PatchEnvelope = parse_json_response(raw, "patch response")?;
     envelope
         .patches
         .into_iter()
@@ -323,8 +322,7 @@ pub fn parse_revision_response(raw: &str) -> Result<Vec<PatchOp>> {
 }
 
 pub fn parse_review_response(raw: &str) -> Result<Vec<ReviewItem>> {
-    let envelope: ReviewEnvelope =
-        serde_json::from_str(raw).context("Failed to parse review response JSON")?;
+    let envelope: ReviewEnvelope = parse_json_response(raw, "review response")?;
     Ok(envelope
         .issues
         .into_iter()
@@ -346,6 +344,73 @@ fn message(role: impl Into<String>, content: impl Into<String>) -> ResponseInput
         role: role.into(),
         content: content.into(),
     }
+}
+
+fn parse_json_response<T>(raw: &str, label: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let trimmed = raw.trim();
+    serde_json::from_str(trimmed)
+        .or_else(|_| {
+            extract_fenced_block(trimmed)
+                .and_then(|candidate| serde_json::from_str(candidate).ok())
+                .ok_or_else(|| serde_json::Error::io(std::io::Error::other("no fenced JSON")))
+        })
+        .or_else(|_| {
+            extract_first_json_object(trimmed)
+                .and_then(|candidate| serde_json::from_str(candidate).ok())
+                .ok_or_else(|| serde_json::Error::io(std::io::Error::other("no embedded JSON")))
+        })
+        .with_context(|| format!("Failed to parse {} JSON", label))
+}
+
+fn extract_fenced_block(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let rest = trimmed.strip_prefix("```")?;
+    let newline_idx = rest.find('\n')?;
+    let body = &rest[newline_idx + 1..];
+    let closing_idx = body.rfind("\n```")?;
+    Some(body[..closing_idx].trim())
+}
+
+fn extract_first_json_object(raw: &str) -> Option<&str> {
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in raw.char_indices() {
+        if let Some(start_idx) = start {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(&raw[start_idx..idx + ch.len_utf8()]);
+                    }
+                }
+                _ => {}
+            }
+        } else if ch == '{' {
+            start = Some(idx);
+            depth = 1;
+        }
+    }
+
+    None
 }
 
 fn json_schema_format(name: &str, schema: serde_json::Value) -> ResponseTextConfig {
@@ -589,5 +654,47 @@ mod tests {
             "Add measurable latency targets."
         );
         assert_eq!(issues[0].status, ReviewStatus::New);
+    }
+
+    #[test]
+    fn parses_fenced_patch_response() {
+        let raw = r#"```json
+{
+  "patches": [
+    {
+      "op": "replace_section",
+      "anchor": "p-0",
+      "content": "Updated.\n",
+      "rationale": "clarify"
+    }
+  ]
+}
+```"#;
+
+        let patches = parse_revision_response(raw).unwrap();
+        assert_eq!(patches.len(), 1);
+    }
+
+    #[test]
+    fn parses_review_response_with_preface() {
+        let raw = r#"Here is the structured result:
+
+```json
+{
+  "issues": [
+    {
+      "category": "contradiction",
+      "anchor": "p-1",
+      "evidence": "A",
+      "why_it_matters": "B",
+      "suggested_resolution": "C"
+    }
+  ]
+}
+```"#;
+
+        let issues = parse_review_response(raw).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].anchor, "p-1");
     }
 }
