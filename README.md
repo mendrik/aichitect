@@ -18,8 +18,9 @@ aichitect --init
 Important config options:
 
 - `api_key` - required
-- `model` - defaults to `gpt-4o`
-- `base_url` - lets you point at OpenAI-compatible endpoints
+- `model` - defaults to `gpt-5.4` and is used for full-document analysis
+- `model_fix` - defaults to `gpt-5.4-mini` and is used for document creation plus patch generation
+- `base_url` - lets you point at OpenAI-compatible endpoints that support the Responses API
 - `organization` / `project` - optional OpenAI headers
 - `temperature` / `max_tokens` - forwarded to API requests when set
 - `system_prompt_override` - replaces the default revision prompt
@@ -50,8 +51,8 @@ aichitect new-spec.md
 | `PgUp`/`PgDn` | Page up/down |
 | `Home`/`End` | Jump to top/bottom of the document |
 | `e` | Edit the current block locally |
-| `r` | Find all occurrences and write one remark for all of them |
-| `A` | Analyze document for issues |
+| `r` | Write a remark for the current selection |
+| `Shift+A` | Analyze document for issues |
 | `H` | Browse patch history snapshots |
 | `W` | Save document |
 | `u`/`U` | Undo/Redo |
@@ -61,7 +62,9 @@ aichitect new-spec.md
 
 ## How the AI calls work
 
-Aichitect sends all AI traffic through OpenAI-compatible `POST /chat/completions` calls. Authentication uses your `api_key`, and `organization`, `project`, and `base_url` are added when configured.
+Aichitect sends all AI traffic through OpenAI's `POST /responses` API. Authentication uses your `api_key`, and `organization`, `project`, and `base_url` are added when configured.
+
+Each document keeps lightweight OpenAI session state on disk so analysis turns and patch turns can chain with `previous_response_id` while the Markdown file in Aichitect remains the canonical source of truth.
 
 There are three AI flows:
 
@@ -71,22 +74,20 @@ When you open a file that does not exist yet, Aichitect asks the model to genera
 
 ### 2. Revision from remarks
 
-When you submit a remark or resolve a review item, Aichitect prefers a targeted revision request. It builds local context packs containing:
+When you submit a remark or accept/customize a review item, Aichitect sends one patch request at a time. Each request prefers a targeted revision context pack containing:
 
 - the target anchor and selected text for each remark
 - nearby section / sibling node context
 - list or code-line context when relevant
-- explicit related occurrences when the same wording appears elsewhere
 
 If the targeted scope grows too large or looks ambiguous, Aichitect falls back to the older full-document request that includes:
 
 - an anchor map for the parsed document
 - the full Markdown document
-- the submitted remarks
-- the selected text for each remark
-- related occurrences when the same wording appears elsewhere
+- the submitted remark
+- the selected text for that remark
 
-The revision system prompt requires the model to answer with JSON only:
+Patch generation uses the smaller `model_fix` model and requires a structured JSON response:
 
 ```json
 {
@@ -105,9 +106,9 @@ Supported patch operations include replacing sections or code blocks, inserting 
 
 ### 3. Review / issue finding
 
-When you press `A`, Aichitect sends the full document plus anchor map to the model and asks for structured review findings. The reply must be JSON with an `issues` array. Each issue points at an anchor, includes evidence from the document, explains why it matters, and suggests a fix.
+When you press `Shift+A`, Aichitect sends the full document plus anchor map to the stronger `model` and asks for structured review findings. The reply must be JSON with an `issues` array. Each issue points at an anchor, includes evidence from the document, explains why it matters, and suggests a concrete resolution.
 
-Those review items can then be answered or accepted in the TUI, after which they are converted into regular remarks and sent back through the patch flow above.
+Those review items form a queue you can work down in the TUI. Each item can be accepted as-is or customized, after which it is converted into a localized patch request and sent back through the patch flow above.
 
 ## How replies patch the document
 
@@ -127,12 +128,13 @@ That history is what the `H` browser shows, and it gives you an on-disk trail of
 
 ## Review Mode
 
-Press `A` to run the AI review pass. In review mode:
+Press `Shift+A` to run the AI review pass. In review mode:
 
-- `j`/`k` - navigate issues
+- `↑`/`↓` - navigate issues
 - `a` - answer the suggested question for an issue
+- `y` - accept the suggested resolution
 - `d` - dismiss an issue
-- `S` - send answered issues as remarks for AI revision
+- `x` - clear cached analysis results
 - `q`/`Esc` - exit review mode
 
 ## CLI flags

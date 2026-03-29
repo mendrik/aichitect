@@ -6,8 +6,7 @@ pub mod ui;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture,
-        EnableBracketedPaste, DisableBracketedPaste,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event,
     },
     execute,
@@ -25,12 +24,17 @@ use app::{App, AppEvent};
 pub async fn run(config: Config, doc: Document) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(64);
-    let mut app = App::new(config, doc, event_tx.clone());
+    let mut app = App::new(config, doc, event_tx.clone())?;
 
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;

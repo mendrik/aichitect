@@ -1,39 +1,40 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+
 use crate::config::Config;
 
-#[allow(dead_code)]
-pub enum StreamEvent {
-    Token(String),
-    Done,
-    Error(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseInputMessage {
     pub role: String,
     pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ChatRequest {
+pub struct ResponseRequest {
     pub model: String,
-    pub messages: Vec<ChatMessage>,
+    pub input: Vec<ResponseInputMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "max_output_tokens")]
+    pub max_output_tokens: Option<u32>,
+    pub store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    pub stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<ResponseFormat>,
+    pub text: Option<ResponseTextConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseFormat {
-    #[serde(rename = "type")]
-    pub r#type: String,
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseTextConfig {
+    pub format: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsePayload {
+    pub id: String,
+    pub text: String,
 }
 
 #[derive(Clone)]
@@ -69,13 +70,17 @@ impl OpenAiClient {
     }
 
     fn base_url(&self) -> String {
-        self.config.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+        self.config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
     }
 
-    #[allow(dead_code)]
-    pub async fn chat(&self, req: ChatRequest) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base_url());
-        let resp = self.http.post(&url)
+    pub async fn respond(&self, req: ResponseRequest) -> Result<ResponsePayload> {
+        let url = format!("{}/responses", self.base_url());
+        let resp = self
+            .http
+            .post(&url)
             .json(&req)
             .send()
             .await
@@ -87,67 +92,97 @@ impl OpenAiClient {
             anyhow::bail!("OpenAI API error {}: {}", status, body);
         }
 
-        let json: serde_json::Value = resp.json().await.context("Failed to parse OpenAI response")?;
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("No content in response: {}", json))?
-            .to_string();
-        Ok(content)
-    }
-
-    #[allow(dead_code)]
-    pub async fn chat_stream(&self, req: ChatRequest, tx: mpsc::Sender<StreamEvent>) -> Result<()> {
-        use futures::StreamExt;
-
-        let url = format!("{}/chat/completions", self.base_url());
-        let resp = self.http.post(&url)
-            .json(&req)
-            .send()
+        let json: Value = resp
+            .json()
             .await
-            .context("Failed to send streaming request to OpenAI")?;
+            .context("Failed to parse OpenAI response")?;
+        parse_response_payload(&json)
+    }
+}
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let _ = tx.send(StreamEvent::Error(format!("OpenAI API error {}: {}", status, body))).await;
-            return Ok(());
-        }
+fn parse_response_payload(json: &Value) -> Result<ResponsePayload> {
+    let id = json["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No response id in payload: {}", json))?
+        .to_string();
 
-        let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+    let mut text = String::new();
+    let mut refusal = None::<String>;
 
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(newline_pos) = buffer.find('\n') {
-                        let line: String = buffer.drain(..=newline_pos).collect();
-                        let line = line.trim();
-
-                        if line.starts_with("data: ") {
-                            let data = &line["data: ".len()..];
-                            if data == "[DONE]" {
-                                let _ = tx.send(StreamEvent::Done).await;
-                                return Ok(());
-                            }
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                                    if !content.is_empty() {
-                                        let _ = tx.send(StreamEvent::Token(content.to_string())).await;
-                                    }
-                                }
+    if let Some(output) = json["output"].as_array() {
+        for item in output {
+            if item["type"].as_str() != Some("message") {
+                continue;
+            }
+            if let Some(parts) = item["content"].as_array() {
+                for part in parts {
+                    match part["type"].as_str() {
+                        Some("output_text") | Some("text") => {
+                            if let Some(chunk) = part["text"].as_str() {
+                                text.push_str(chunk);
                             }
                         }
+                        Some("refusal") => {
+                            if let Some(message) = part["refusal"].as_str() {
+                                refusal = Some(message.to_string());
+                            }
+                        }
+                        _ => {}
                     }
-                }
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                    return Ok(());
                 }
             }
         }
+    }
 
-        let _ = tx.send(StreamEvent::Done).await;
-        Ok(())
+    if text.trim().is_empty() {
+        if let Some(message) = refusal {
+            anyhow::bail!("Model refused request: {}", message);
+        }
+        anyhow::bail!("No text content in response: {}", json);
+    }
+
+    Ok(ResponsePayload { id, text })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_output_text_from_response_payload() {
+        let payload = json!({
+            "id": "resp_123",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "{\"patches\": []}"}
+                    ]
+                }
+            ]
+        });
+
+        let parsed = parse_response_payload(&payload).unwrap();
+        assert_eq!(parsed.id, "resp_123");
+        assert_eq!(parsed.text, "{\"patches\": []}");
+    }
+
+    #[test]
+    fn surfaces_refusals_when_no_text_is_returned() {
+        let payload = json!({
+            "id": "resp_123",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "refusal", "refusal": "Nope"}
+                    ]
+                }
+            ]
+        });
+
+        let err = parse_response_payload(&payload).unwrap_err();
+        assert!(err.to_string().contains("Nope"));
     }
 }

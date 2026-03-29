@@ -1,12 +1,12 @@
 use crate::config::Config;
-use crate::document::{AnchorId, Document, PatchOp, StyledLine, truncate_chars};
-use crate::openai::client::{ChatRequest, OpenAiClient, StreamEvent};
+use crate::document::{truncate_chars, AnchorId, Document, PatchOp, StyledLine};
+use crate::openai::client::{OpenAiClient, ResponsePayload, ResponseRequest};
+use crate::openai::prompts;
+use crate::openai::session::DocumentSessionStore;
 use crate::remarks::{Remark, RemarkStatus, RemarkStore, TargetType};
 use crate::review::{ReviewItem, ReviewStore};
-use crate::openai::prompts;
-use crate::revision_context::RevisionRequestMode;
 use crate::tui::input::InputBuffer;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arboard::Clipboard;
 use chrono::Utc;
 use ratatui::layout::Rect;
@@ -39,15 +39,27 @@ pub enum AppMode {
 
 #[allow(dead_code)]
 pub enum AppEvent {
-    StreamToken(String),
-    StreamDone,
-    StreamError(String),
-    PatchesReceived(Vec<PatchOp>, HashMap<AnchorId, crate::document::BlockFingerprint>),
-    ReviewReceived(Vec<ReviewItem>),
-    DocumentCreated(String),
+    PatchReceived {
+        remark_id: Uuid,
+        patches: Vec<PatchOp>,
+        snapshot: HashMap<AnchorId, crate::document::BlockFingerprint>,
+        response_id: String,
+    },
+    PatchFailed {
+        remark_id: Uuid,
+        message: String,
+    },
+    ReviewReceived {
+        items: Vec<ReviewItem>,
+        response_id: String,
+    },
+    AnalysisFailed(String),
+    DocumentCreated {
+        content: String,
+        response_id: String,
+    },
+    CreationFailed(String),
     StatusMessage(String),
-    Loading(bool),
-    RequestProgress(usize),
 }
 
 pub struct App {
@@ -56,6 +68,7 @@ pub struct App {
     pub remarks: RemarkStore,
     pub review_store: ReviewStore,
     pub mode: AppMode,
+    session_store: DocumentSessionStore,
     pub scroll_offset: usize,
     pub selected_node: Option<usize>,
     /// Which line within the currently selected code block is highlighted (0-based).
@@ -65,7 +78,7 @@ pub struct App {
     pub input: InputBuffer,
     pub status_message: Option<String>,
     pub is_loading: bool,
-    pub streaming_response: String,
+    active_request_count: usize,
     pub should_quit: bool,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub display_lines: Vec<StyledLine>,
@@ -86,16 +99,13 @@ pub struct App {
     pub selected_history: usize,
     pub history_preview: String,
     pub history_scroll: usize,
-    /// Occurrence hits for the current find-occurrences query.
-    /// Each entry is (anchor_id, text_snippet).  Cleared on navigation / Esc.
-    pub occurrence_hits: Vec<(String, String)>,
     /// Search hits for the Ctrl-F search flow.
     pub search_hits: Vec<(String, String)>,
     /// Currently selected search hit index.
     pub selected_search_hit: Option<usize>,
     /// Incremented every event-loop tick; drives spinner + gradient animations.
     pub spinner_tick: u64,
-    /// Label + chars received so far during a streaming request. `None` when
+    /// Label + chars received so far during a long-running request. `None` when
     /// no request-progress overlay should be shown.
     pub request_progress: Option<(String, usize)>,
     /// True when the user asked to see review results as soon as background
@@ -110,28 +120,36 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config, doc: Document, event_tx: mpsc::Sender<AppEvent>) -> Self {
+    pub fn new(config: Config, doc: Document, event_tx: mpsc::Sender<AppEvent>) -> Result<Self> {
         let is_new = doc.is_new();
         let display_lines = doc.render_display(80, &HashSet::new());
-        let mode = if is_new { AppMode::CreationPrompt } else { AppMode::Normal };
+        let mode = if is_new {
+            AppMode::CreationPrompt
+        } else {
+            AppMode::Normal
+        };
         let status = if is_new {
             Some("New file — describe what to create, then press Enter to generate.".to_string())
         } else {
-            Some("Press ? for help  ←/→ collapse/expand heading  c: collapse/expand all".to_string())
+            Some(
+                "Press ? for help  ←/→ collapse/expand heading  c: collapse/expand all".to_string(),
+            )
         };
-        App {
+        let session_store = DocumentSessionStore::for_doc(&doc.path)?;
+        Ok(App {
             config,
             doc,
             remarks: RemarkStore::new(),
             review_store: ReviewStore::new(),
             mode,
+            session_store,
             scroll_offset: 0,
             selected_node: None,
             selected_line_in_node: None,
             input: InputBuffer::new(),
             status_message: status,
             is_loading: false,
-            streaming_response: String::new(),
+            active_request_count: 0,
             should_quit: false,
             event_tx,
             display_lines,
@@ -148,7 +166,6 @@ impl App {
             selected_history: 0,
             history_preview: String::new(),
             history_scroll: 0,
-            occurrence_hits: vec![],
             search_hits: vec![],
             selected_search_hit: None,
             spinner_tick: 0,
@@ -157,7 +174,7 @@ impl App {
             direct_edit_anchor: None,
             selected_table_col: None,
             direct_edit_table_cell: None,
-        }
+        })
     }
 
     fn start_request_progress(&mut self, label: impl Into<String>) {
@@ -168,6 +185,16 @@ impl App {
         self.request_progress = None;
     }
 
+    fn begin_request(&mut self) {
+        self.active_request_count = self.active_request_count.saturating_add(1);
+        self.is_loading = self.active_request_count > 0;
+    }
+
+    fn finish_request(&mut self) {
+        self.active_request_count = self.active_request_count.saturating_sub(1);
+        self.is_loading = self.active_request_count > 0;
+    }
+
     fn analysis_in_progress(&self) -> bool {
         matches!(
             self.request_progress.as_ref(),
@@ -175,38 +202,18 @@ impl App {
         )
     }
 
-    async fn collect_streaming_response(
+    async fn execute_response(
         client: OpenAiClient,
-        mut req: ChatRequest,
-        tx: mpsc::Sender<AppEvent>,
-    ) -> Result<String> {
-        req.stream = true;
-        let (stream_tx, mut stream_rx) = mpsc::channel(64);
-        let stream_task = tokio::spawn(async move { client.chat_stream(req, stream_tx).await });
-        let mut content = String::new();
-
-        while let Some(event) = stream_rx.recv().await {
-            match event {
-                StreamEvent::Token(token) => {
-                    content.push_str(&token);
-                    let _ = tx.send(AppEvent::RequestProgress(content.len())).await;
-                }
-                StreamEvent::Done => break,
-                StreamEvent::Error(error) => anyhow::bail!(error),
-            }
-        }
-
-        stream_task
-            .await
-            .context("Streaming task failed to join")??;
-
-        Ok(content)
+        req: ResponseRequest,
+    ) -> Result<ResponsePayload> {
+        client.respond(req).await
     }
 
     pub fn refresh_display(&mut self) {
-        self.display_lines = self
-            .doc
-            .render_display(self.terminal_width.saturating_sub(4) as usize, &self.collapsed_sections);
+        self.display_lines = self.doc.render_display(
+            self.terminal_width.saturating_sub(4) as usize,
+            &self.collapsed_sections,
+        );
     }
 
     // ── Document scrolling ───────────────────────────────────────────────────
@@ -259,13 +266,17 @@ impl App {
     }
 
     fn is_code_block(&self, node_idx: usize) -> bool {
-        self.doc.nodes.get(node_idx)
+        self.doc
+            .nodes
+            .get(node_idx)
             .map(|n| matches!(n.kind, crate::document::NodeKind::CodeBlock { .. }))
             .unwrap_or(false)
     }
 
     fn is_table(&self, node_idx: usize) -> bool {
-        self.doc.nodes.get(node_idx)
+        self.doc
+            .nodes
+            .get(node_idx)
             .map(|n| matches!(n.kind, crate::document::NodeKind::Table { .. }))
             .unwrap_or(false)
     }
@@ -297,7 +308,9 @@ impl App {
     pub fn table_next_col(&mut self) {
         if let Some(ni) = self.selected_node {
             let col_count = self.table_col_count(ni);
-            if col_count == 0 { return; }
+            if col_count == 0 {
+                return;
+            }
             self.selected_table_col = Some(match self.selected_table_col {
                 None => 0,
                 Some(c) => (c + 1).min(col_count - 1),
@@ -308,7 +321,9 @@ impl App {
     pub fn table_prev_col(&mut self) {
         if let Some(ni) = self.selected_node {
             let col_count = self.table_col_count(ni);
-            if col_count == 0 { return; }
+            if col_count == 0 {
+                return;
+            }
             self.selected_table_col = Some(match self.selected_table_col {
                 None | Some(0) => 0,
                 Some(c) => c - 1,
@@ -340,7 +355,9 @@ impl App {
         }
 
         let visible = self.doc.visible_node_indices(&self.collapsed_sections);
-        if visible.is_empty() { return; }
+        if visible.is_empty() {
+            return;
+        }
         let next = match self.selected_node {
             None => visible[0],
             Some(cur) => {
@@ -388,7 +405,9 @@ impl App {
         }
 
         let visible = self.doc.visible_node_indices(&self.collapsed_sections);
-        if visible.is_empty() { return; }
+        if visible.is_empty() {
+            return;
+        }
         let prev = match self.selected_node {
             None => visible[0],
             Some(cur) => {
@@ -453,9 +472,15 @@ impl App {
     /// Collapse all headings from the selected heading downward, including the
     /// current heading and leaving headings above untouched.
     pub fn collapse_headings_below(&mut self) {
-        let Some(idx) = self.selected_node else { return; };
-        let Some(node) = self.doc.nodes.get(idx) else { return; };
-        let crate::document::NodeKind::Heading { .. } = node.kind else { return; };
+        let Some(idx) = self.selected_node else {
+            return;
+        };
+        let Some(node) = self.doc.nodes.get(idx) else {
+            return;
+        };
+        let crate::document::NodeKind::Heading { .. } = node.kind else {
+            return;
+        };
 
         let mut collapsed = 0usize;
         for node in self.doc.nodes.iter().skip(idx) {
@@ -481,9 +506,15 @@ impl App {
     /// Expand all headings from the selected heading downward, including the
     /// current heading and leaving headings above untouched.
     pub fn expand_headings_below(&mut self) {
-        let Some(idx) = self.selected_node else { return; };
-        let Some(node) = self.doc.nodes.get(idx) else { return; };
-        let crate::document::NodeKind::Heading { .. } = node.kind else { return; };
+        let Some(idx) = self.selected_node else {
+            return;
+        };
+        let Some(node) = self.doc.nodes.get(idx) else {
+            return;
+        };
+        let crate::document::NodeKind::Heading { .. } = node.kind else {
+            return;
+        };
 
         let mut expanded = 0usize;
         for node in self.doc.nodes.iter().skip(idx) {
@@ -552,7 +583,9 @@ impl App {
     }
 
     pub fn history_next(&mut self) {
-        if self.history_entries.is_empty() { return; }
+        if self.history_entries.is_empty() {
+            return;
+        }
         let max = self.history_entries.len() - 1;
         if self.selected_history < max {
             self.selected_history += 1;
@@ -577,15 +610,20 @@ impl App {
     }
 
     pub fn restore_history(&mut self) {
-        if self.history_entries.is_empty() { return; }
+        if self.history_entries.is_empty() {
+            return;
+        }
         let content = self.history_preview.clone();
-        if content.is_empty() { return; }
+        if content.is_empty() {
+            return;
+        }
         // Snapshot the current state before overwriting.
         match self.doc.set_content(content) {
             Ok(()) => {
                 self.refresh_display();
                 self.mode = AppMode::Normal;
-                let label = self.history_entries
+                let label = self
+                    .history_entries
                     .get(self.selected_history)
                     .map(|e| e.label.clone())
                     .unwrap_or_default();
@@ -638,9 +676,11 @@ impl App {
     }
 
     fn scroll_to_code_line(&mut self, node_idx: usize, line_in_block: usize) {
-        if let Some(pos) = self.display_lines.iter().position(|l| {
-            l.node_index == Some(node_idx) && l.line_in_block == Some(line_in_block)
-        }) {
+        if let Some(pos) = self
+            .display_lines
+            .iter()
+            .position(|l| l.node_index == Some(node_idx) && l.line_in_block == Some(line_in_block))
+        {
             self.scroll_into_view(pos);
         }
     }
@@ -682,7 +722,9 @@ impl App {
         }
 
         if let crate::document::NodeKind::Table { rows, .. } = &node.kind {
-            if let (Some(row_idx), Some(col_idx)) = (self.selected_line_in_node, self.selected_table_col) {
+            if let (Some(row_idx), Some(col_idx)) =
+                (self.selected_line_in_node, self.selected_table_col)
+            {
                 return rows.get(row_idx).and_then(|r| r.get(col_idx)).cloned();
             }
         }
@@ -695,7 +737,8 @@ impl App {
 
     pub fn copy_current_selection(&mut self) {
         let Some(selection) = self.current_selection_text() else {
-            self.status_message = Some("Select something first, then press Ctrl+C to copy.".to_string());
+            self.status_message =
+                Some("Select something first, then press Ctrl+C to copy.".to_string());
             return;
         };
 
@@ -716,7 +759,8 @@ impl App {
             self.status_message = Some("No node selected.".to_string());
             return;
         };
-        let url = self.display_lines
+        let url = self
+            .display_lines
             .iter()
             .filter(|l| l.node_index == Some(node_idx))
             .find_map(|l| l.first_link_url.clone());
@@ -738,7 +782,11 @@ impl App {
                 }
             }
         } else {
-            let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
             match std::process::Command::new(opener).arg(&url).spawn() {
                 Ok(_) => self.status_message = Some(format!("Opening: {}", url)),
                 Err(e) => self.status_message = Some(format!("Cannot open '{}': {}", url, e)),
@@ -753,7 +801,10 @@ impl App {
         self.input.clear();
         self.search_hits.clear();
         self.selected_search_hit = None;
-        self.status_message = Some("Search: type to find matches, Enter next, Shift+Enter previous, Esc close.".to_string());
+        self.status_message = Some(
+            "Search: type to find matches, Enter next, Shift+Enter previous, Esc close."
+                .to_string(),
+        );
     }
 
     pub fn update_search(&mut self) {
@@ -761,7 +812,10 @@ impl App {
         if query.is_empty() {
             self.search_hits.clear();
             self.selected_search_hit = None;
-            self.status_message = Some("Search: type to find matches, Enter next, Shift+Enter previous, Esc close.".to_string());
+            self.status_message = Some(
+                "Search: type to find matches, Enter next, Shift+Enter previous, Esc close."
+                    .to_string(),
+            );
             return;
         }
 
@@ -779,7 +833,11 @@ impl App {
         self.status_message = Some(format!(
             "{} match{} for \"{}\". Enter next, Shift+Enter previous, Esc close.",
             self.search_hits.len(),
-            if self.search_hits.len() == 1 { "" } else { "es" },
+            if self.search_hits.len() == 1 {
+                ""
+            } else {
+                "es"
+            },
             query
         ));
     }
@@ -832,7 +890,8 @@ impl App {
         if let crate::document::NodeKind::Table { rows, .. } = &node.kind {
             match (self.selected_line_in_node, self.selected_table_col) {
                 (Some(row_idx), Some(col_idx)) => {
-                    let cell = rows.get(row_idx)
+                    let cell = rows
+                        .get(row_idx)
                         .and_then(|r| r.get(col_idx))
                         .cloned()
                         .unwrap_or_default();
@@ -840,11 +899,16 @@ impl App {
                     self.direct_edit_table_cell = Some((row_idx, col_idx));
                     self.input.set_text(cell);
                     self.mode = AppMode::DirectEdit;
-                    self.status_message = Some("Editing cell. Enter save  Esc cancel  (pipes escaped automatically)".to_string());
+                    self.status_message = Some(
+                        "Editing cell. Enter save  Esc cancel  (pipes escaped automatically)"
+                            .to_string(),
+                    );
                     return;
                 }
                 _ => {
-                    self.status_message = Some("Navigate to a cell first (←→ to select a column, then e).".to_string());
+                    self.status_message = Some(
+                        "Navigate to a cell first (←→ to select a column, then e).".to_string(),
+                    );
                     return;
                 }
             }
@@ -874,7 +938,8 @@ impl App {
         self.direct_edit_anchor = Some(anchor);
         self.input.set_text(initial_text);
         self.mode = AppMode::DirectEdit;
-        self.status_message = Some("Editing block locally. Enter save  Alt+Enter newline  Esc cancel".to_string());
+        self.status_message =
+            Some("Editing block locally. Enter save  Alt+Enter newline  Esc cancel".to_string());
     }
 
     pub fn submit_direct_edit(&mut self) {
@@ -919,14 +984,22 @@ impl App {
                         self.direct_edit_anchor = None;
                         self.mode = AppMode::Normal;
                         if let Err(e) = self.doc.save() {
-                            self.status_message = Some(format!("Saved in memory, write failed: {}", e));
+                            self.status_message =
+                                Some(format!("Saved in memory, write failed: {}", e));
                         } else if skipped.is_empty() {
-                            self.status_message = Some(format!("Updated {} block(s) locally.", applied.len()));
+                            self.status_message =
+                                Some(format!("Updated {} block(s) locally.", applied.len()));
                         } else {
-                            self.status_message = Some(format!("Updated {}, skipped {}.", applied.len(), skipped.len()));
+                            self.status_message = Some(format!(
+                                "Updated {}, skipped {}.",
+                                applied.len(),
+                                skipped.len()
+                            ));
                         }
                     }
-                    Err(e) => { self.status_message = Some(format!("Cell edit failed: {}", e)); }
+                    Err(e) => {
+                        self.status_message = Some(format!("Cell edit failed: {}", e));
+                    }
                 }
             } else {
                 self.direct_edit_table_cell = None;
@@ -959,7 +1032,8 @@ impl App {
 
             match &node.kind {
                 crate::document::NodeKind::CodeBlock { code, lang } => {
-                    let mut lines: Vec<String> = code.lines().map(|line| line.to_string()).collect();
+                    let mut lines: Vec<String> =
+                        code.lines().map(|line| line.to_string()).collect();
                     if line_idx < lines.len() {
                         lines[line_idx] = replacement;
                     } else {
@@ -973,7 +1047,8 @@ impl App {
                     }
                 }
                 _ => {
-                    self.status_message = Some("Only code lines support line-level direct edit.".to_string());
+                    self.status_message =
+                        Some("Only code lines support line-level direct edit.".to_string());
                     return;
                 }
             }
@@ -1031,9 +1106,11 @@ impl App {
                 self.direct_edit_anchor = None;
                 self.mode = AppMode::Normal;
                 if let Err(e) = self.doc.save() {
-                    self.status_message = Some(format!("Saved edit in memory, but write failed: {}", e));
+                    self.status_message =
+                        Some(format!("Saved edit in memory, but write failed: {}", e));
                 } else if skipped.is_empty() {
-                    self.status_message = Some(format!("Updated {} block(s) locally.", applied.len()));
+                    self.status_message =
+                        Some(format!("Updated {} block(s) locally.", applied.len()));
                 } else {
                     self.status_message = Some(format!(
                         "Updated {} block(s), skipped {}.",
@@ -1048,86 +1125,22 @@ impl App {
         }
     }
 
-    /// Find all occurrences of the selected node's text in the rest of the
-    /// document, highlight them, then open the remark input.
-    /// If no selection exists this is a no-op.
-    pub fn find_and_show_occurrences(&mut self) {
-        let query = match self.selected_node {
-            None => {
-                self.status_message = Some("Select a node first (↑/↓ to navigate)".to_string());
-                return;
-            }
-            Some(idx) => {
-                let node = &self.doc.nodes[idx];
-                // For code-block line selection use the specific line text.
-                if let crate::document::NodeKind::CodeBlock { code, .. } = &node.kind {
-                    if let Some(li) = self.selected_line_in_node {
-                        code.lines().nth(li).unwrap_or("").trim().to_string()
-                    } else {
-                        // whole block — use the first non-empty line as query
-                        code.lines()
-                            .find(|l| !l.trim().is_empty())
-                            .unwrap_or("")
-                            .trim()
-                            .to_string()
-                    }
-                } else {
-                    match &node.kind {
-                        crate::document::NodeKind::Heading { text, .. } => text.clone(),
-                        crate::document::NodeKind::Paragraph { text } => {
-                            // Use first sentence / 60 chars as query to avoid over-matching.
-                            let end = text
-                                .find(|c| c == '.' || c == '!' || c == '?')
-                                .map(|i| i + 1)
-                                .unwrap_or(text.len());
-                            let sentence = &text[..end];
-                            truncate_chars(sentence, 60).trim().to_string()
-                        }
-                        crate::document::NodeKind::ListItem { text, .. } => text.clone(),
-                        crate::document::NodeKind::BlockQuote { text } => text.clone(),
-                        _ => String::new(),
-                    }
-                }
-            }
+    pub fn start_remark(&mut self) {
+        let Some(idx) = self.selected_node else {
+            self.status_message = Some("Select a node first (↑/↓ to navigate)".to_string());
+            return;
         };
 
-        if query.trim().is_empty() {
-            self.status_message = Some("Nothing to search for in this node.".to_string());
-            return;
-        }
-
-        let exclude = self.selected_node.map(|i| self.doc.nodes[i].anchor.clone());
-        // Also exclude the specific code-block-line anchor if set.
-        let exclude_str = match self.selected_line_in_node {
-            Some(li) => exclude
-                .as_ref()
-                .map(|a| format!("{}:L{}", a, li)),
-            None => exclude,
-        };
-        let hits = self
-            .doc
-            .find_occurrences(&query, exclude_str.as_deref());
-
-        if hits.is_empty() {
-            self.status_message = Some(format!("No other occurrences of \"{}\".", query));
-            return;
-        }
-
-        let count = hits.len();
-        self.occurrence_hits = hits;
-        self.mode = AppMode::RemarkEdit;
+        self.clear_occurrences();
         self.input.clear();
+        self.mode = AppMode::RemarkEdit;
         self.status_message = Some(format!(
-            "{} occurrence{} found — write your change instruction and press Enter",
-            count,
-            if count == 1 { "" } else { "s" }
+            "Remark on {} — describe the change and press Enter.",
+            self.doc.nodes[idx].anchor
         ));
     }
 
-    /// Clear occurrence highlights (called on navigation, Esc, submit).
-    pub fn clear_occurrences(&mut self) {
-        self.occurrence_hits.clear();
-    }
+    pub fn clear_occurrences(&mut self) {}
 
     pub async fn submit_remark(&mut self) {
         if let Some(node_idx) = self.selected_node {
@@ -1165,29 +1178,49 @@ impl App {
                 }
                 crate::document::NodeKind::ListItem { text, .. } => {
                     let ctx = self.collect_list_context(node_idx);
-                    (text.clone(), node.anchor.clone(), TargetType::ListItem, Some(ctx))
+                    (
+                        text.clone(),
+                        node.anchor.clone(),
+                        TargetType::ListItem,
+                        Some(ctx),
+                    )
                 }
-                crate::document::NodeKind::BlockQuote { text } => {
-                    (text.clone(), node.anchor.clone(), TargetType::TextSpan, None)
-                }
-                _ => (String::new(), node.anchor.clone(), TargetType::TextSpan, None),
+                crate::document::NodeKind::BlockQuote { text } => (
+                    text.clone(),
+                    node.anchor.clone(),
+                    TargetType::TextSpan,
+                    None,
+                ),
+                _ => (
+                    String::new(),
+                    node.anchor.clone(),
+                    TargetType::TextSpan,
+                    None,
+                ),
             };
-            let occurrence_anchors = std::mem::take(&mut self.occurrence_hits);
             let remark = Remark {
                 id: Uuid::new_v4(),
+                source_review_id: None,
                 anchor,
                 selected_text,
                 target_type,
                 text,
                 list_context,
-                occurrence_anchors,
+                occurrence_anchors: Vec::new(),
                 created_at: Utc::now(),
                 status: RemarkStatus::Pending,
             };
             self.remarks.add(remark);
             self.input.clear();
             self.mode = AppMode::Normal;
-            self.send_remarks().await;
+            if self.remark_request_in_flight() {
+                self.status_message = Some(
+                    "Queued remark — it will be sent after the current patch finishes.".to_string(),
+                );
+            } else {
+                self.status_message = Some("Sending remark for patch generation…".to_string());
+                self.send_next_remark().await;
+            }
         }
     }
 
@@ -1199,7 +1232,10 @@ impl App {
         // Walk backward to the first item in this contiguous list.
         let mut start = node_idx;
         while start > 0 {
-            if matches!(nodes[start - 1].kind, crate::document::NodeKind::ListItem { .. }) {
+            if matches!(
+                nodes[start - 1].kind,
+                crate::document::NodeKind::ListItem { .. }
+            ) {
                 start -= 1;
             } else {
                 break;
@@ -1209,7 +1245,10 @@ impl App {
         // Walk forward to the last item.
         let mut end = node_idx;
         while end + 1 < nodes.len() {
-            if matches!(nodes[end + 1].kind, crate::document::NodeKind::ListItem { .. }) {
+            if matches!(
+                nodes[end + 1].kind,
+                crate::document::NodeKind::ListItem { .. }
+            ) {
                 end += 1;
             } else {
                 break;
@@ -1238,58 +1277,91 @@ impl App {
 
     // ── AI submission flows ──────────────────────────────────────────────────
 
-    pub async fn send_remarks(&mut self) {
-        let pending: Vec<_> = self.remarks.pending().into_iter().cloned().collect();
-        if pending.is_empty() {
-            self.status_message = Some("No pending remarks to send.".to_string());
+    fn remark_request_in_flight(&self) -> bool {
+        self.remarks
+            .remarks
+            .iter()
+            .any(|remark| remark.status == RemarkStatus::Sent)
+    }
+
+    pub async fn send_next_remark(&mut self) {
+        if self.remark_request_in_flight() {
             return;
         }
-        self.is_loading = true;
-        let refs: Vec<&Remark> = pending.iter().collect();
-        let prepared = prompts::build_revision_request(&self.config, &self.doc, &refs);
-        self.status_message = Some(match prepared.mode {
-            RevisionRequestMode::Targeted => {
-                format!("Sending {} remark(s) with targeted context…", pending.len())
-            }
-            RevisionRequestMode::FullDocument => {
-                format!("Sending {} remark(s) with full-document fallback…", pending.len())
-            }
-        });
+
+        let Some(remark_id) = self
+            .remarks
+            .remarks
+            .iter()
+            .find(|remark| remark.status == RemarkStatus::Pending)
+            .map(|remark| remark.id)
+        else {
+            return;
+        };
+
+        let Some(remark) = self.remarks.get(remark_id).cloned() else {
+            return;
+        };
+
+        if let Some(current) = self.remarks.get_mut(remark_id) {
+            current.status = RemarkStatus::Sent;
+        }
+        if let Some(review_id) = remark.source_review_id {
+            self.review_store.mark_sent(&[review_id]);
+        }
+
+        self.begin_request();
+
+        let previous_response_id = self.session_store.patch_previous_response_id();
+        let req = prompts::build_revision_request(
+            &self.config,
+            &self.doc,
+            &[&remark],
+            previous_response_id,
+        );
 
         let config = Arc::new(self.config.clone());
-        let client = OpenAiClient::new(config.clone());
-        let req = prepared.request;
+        let client = OpenAiClient::new(config);
         let snapshot = self.doc.content_snapshot();
         let tx = self.event_tx.clone();
 
         tokio::spawn(async move {
-            match Self::collect_streaming_response(client, req, tx.clone()).await {
-                Ok(response) => {
-                    match serde_json::from_str::<serde_json::Value>(&response) {
-                        Ok(json) => {
-                            if let Some(arr) = json["patches"].as_array() {
-                                let patches: Vec<PatchOp> = arr
-                                    .iter()
-                                    .filter_map(|p| serde_json::from_value(p.clone()).ok())
-                                    .collect();
-                                let _ = tx.send(AppEvent::PatchesReceived(patches, snapshot)).await;
-                            } else {
-                                let _ = tx
-                                    .send(AppEvent::StreamError(
-                                        "No patches in response".to_string(),
-                                    ))
-                                    .await;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx
-                                .send(AppEvent::StreamError(format!("JSON parse error: {}", e)))
-                                .await;
-                        }
+            match Self::execute_response(client, req).await {
+                Ok(payload) => match prompts::parse_revision_response(&payload.text) {
+                    Ok(patches) if patches.is_empty() => {
+                        let _ = tx
+                            .send(AppEvent::PatchFailed {
+                                remark_id,
+                                message: "No patches were returned for this remark.".to_string(),
+                            })
+                            .await;
                     }
-                }
+                    Ok(patches) => {
+                        let _ = tx
+                            .send(AppEvent::PatchReceived {
+                                remark_id,
+                                patches,
+                                snapshot,
+                                response_id: payload.id,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(AppEvent::PatchFailed {
+                                remark_id,
+                                message: e.to_string(),
+                            })
+                            .await;
+                    }
+                },
                 Err(e) => {
-                    let _ = tx.send(AppEvent::StreamError(e.to_string())).await;
+                    let _ = tx
+                        .send(AppEvent::PatchFailed {
+                            remark_id,
+                            message: e.to_string(),
+                        })
+                        .await;
                 }
             }
         });
@@ -1338,7 +1410,7 @@ impl App {
             return;
         }
 
-        self.is_loading = true;
+        self.begin_request();
         self.start_request_progress("ANALYZING DOCUMENT");
         self.status_message = Some(
             "Analyzing document in the background… keep editing; review will open when ready."
@@ -1346,41 +1418,31 @@ impl App {
         );
 
         let config = Arc::new(self.config.clone());
-        let client = OpenAiClient::new(config.clone());
-        let req = prompts::build_ambiguity_request(&self.config, &self.doc);
+        let client = OpenAiClient::new(config);
+        let req = prompts::build_ambiguity_request(
+            &self.config,
+            &self.doc,
+            self.session_store.analysis_previous_response_id(),
+        );
         let tx = self.event_tx.clone();
 
         tokio::spawn(async move {
-            match Self::collect_streaming_response(client, req, tx.clone()).await {
-                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(json) => {
-                    if let Some(arr) = json["issues"].as_array() {
-                        let items: Vec<ReviewItem> = arr
-                            .iter()
-                            .filter_map(|item| {
-                                Some(ReviewItem {
-                                    id: Uuid::new_v4(),
-                                    category: serde_json::from_value(item["category"].clone()).ok()?,
-                                    anchor: item["anchor"].as_str()?.to_string(),
-                                    evidence: item["evidence"].as_str().unwrap_or("").to_string(),
-                                    why_it_matters: item["why_it_matters"].as_str().unwrap_or("").to_string(),
-                                    suggested_resolution: item["suggested_resolution"].as_str().unwrap_or("").to_string(),
-                                    status: crate::review::ReviewStatus::New,
-                                    user_answer: None,
-                                })
+            match Self::execute_response(client, req).await {
+                Ok(payload) => match prompts::parse_review_response(&payload.text) {
+                    Ok(items) => {
+                        let _ = tx
+                            .send(AppEvent::ReviewReceived {
+                                items,
+                                response_id: payload.id,
                             })
-                            .collect();
-                        let _ = tx.send(AppEvent::ReviewReceived(items)).await;
-                    } else {
-                        let _ = tx.send(AppEvent::StreamError("No issues in response".to_string())).await;
+                            .await;
                     }
-                }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::AnalysisFailed(e.to_string())).await;
+                    }
+                },
                 Err(e) => {
-                    let _ = tx.send(AppEvent::StreamError(format!("JSON parse error: {}", e))).await;
-                }
-            },
-                Err(e) => {
-                    let _ = tx.send(AppEvent::StreamError(e.to_string())).await;
+                    let _ = tx.send(AppEvent::AnalysisFailed(e.to_string())).await;
                 }
             };
         });
@@ -1394,22 +1456,27 @@ impl App {
                 Some("Please describe what to create before pressing Enter.".to_string());
             return;
         }
-        self.is_loading = true;
+        self.begin_request();
         self.start_request_progress("CREATING DOCUMENT");
         self.status_message = Some("Creating document…".to_string());
 
         let config = Arc::new(self.config.clone());
-        let client = OpenAiClient::new(config.clone());
-        let req = prompts::build_creation_request(&self.config, &prompt);
+        let client = OpenAiClient::new(config);
+        let req = prompts::build_creation_request(&self.config, &prompt, None);
         let tx = self.event_tx.clone();
 
         tokio::spawn(async move {
-            match Self::collect_streaming_response(client, req, tx.clone()).await {
-                Ok(content) => {
-                    let _ = tx.send(AppEvent::DocumentCreated(content)).await;
+            match Self::execute_response(client, req).await {
+                Ok(payload) => {
+                    let _ = tx
+                        .send(AppEvent::DocumentCreated {
+                            content: payload.text,
+                            response_id: payload.id,
+                        })
+                        .await;
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::StreamError(e.to_string())).await;
+                    let _ = tx.send(AppEvent::CreationFailed(e.to_string())).await;
                 }
             }
         });
@@ -1449,7 +1516,8 @@ impl App {
     }
 
     /// Convert review item at `pending[idx]` into a remark with `answer`,
-    /// mark it Sent, advance the selection, then fire send_remarks.
+    /// queue it for patch generation, advance the selection, then fire the
+    /// next patch request when possible.
     async fn submit_review_item(&mut self, idx: usize, answer: String) {
         let pending: Vec<_> = self.review_store.pending().into_iter().cloned().collect();
         let item = match pending.get(idx) {
@@ -1457,14 +1525,11 @@ impl App {
             None => return,
         };
 
-        // Find other document locations that mention the same evidence text.
-        let occurrence_anchors = self
-            .doc
-            .find_occurrences(&item.evidence, Some(item.anchor.as_str()));
+        self.review_store.mark_pending(item.id, answer.clone());
 
-        // Build a remark from the review item + user answer.
         let remark = Remark {
             id: Uuid::new_v4(),
+            source_review_id: Some(item.id),
             anchor: item.anchor.clone(),
             selected_text: item.evidence.clone(),
             target_type: TargetType::Paragraph,
@@ -1476,14 +1541,11 @@ impl App {
                 answer
             ),
             list_context: None,
-            occurrence_anchors,
+            occurrence_anchors: Vec::new(),
             created_at: Utc::now(),
             status: RemarkStatus::Pending,
         };
         self.remarks.add(remark);
-
-        // Mark item as Sent immediately so it leaves the pending list.
-        self.review_store.mark_sent(&[item.id]);
 
         // Advance selection to the next remaining item.
         let remaining = self.review_store.pending().len();
@@ -1498,7 +1560,14 @@ impl App {
             self.status_message = Some("All review items resolved — sending patches…".to_string());
         }
 
-        self.send_remarks().await;
+        if self.remark_request_in_flight() {
+            self.status_message = Some(
+                "Queued review fix — it will be sent after the current patch finishes.".to_string(),
+            );
+        } else {
+            self.status_message = Some("Sending accepted review fix…".to_string());
+            self.send_next_remark().await;
+        }
     }
 
     pub fn dismiss_review(&mut self) {
@@ -1522,7 +1591,10 @@ impl App {
         self.selected_review = None;
         self.input.clear();
         self.mode = AppMode::ReviewMode;
-        self.status_message = Some("Cleared cached review results. Press q to close, then A to analyze again.".to_string());
+        self.status_message = Some(
+            "Cleared cached review results. Press q to close, then Shift+A to analyze again."
+                .to_string(),
+        );
     }
 
     // ── Misc ─────────────────────────────────────────────────────────────────
@@ -1556,44 +1628,33 @@ impl App {
 
     pub async fn handle_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::StreamToken(t) => {
-                self.streaming_response.push_str(&t);
-            }
-            AppEvent::StreamDone => {
-                self.is_loading = false;
-                self.streaming_response.clear();
-            }
-            AppEvent::StreamError(e) => {
-                self.is_loading = false;
-                if self.analysis_in_progress() {
-                    self.open_review_when_ready = false;
-                }
-                self.clear_request_progress();
-                self.status_message = Some(format!("Error: {}", e));
-                self.streaming_response.clear();
-            }
-            AppEvent::PatchesReceived(patches, snapshot) => {
-                self.is_loading = false;
-                self.clear_request_progress();
+            AppEvent::PatchReceived {
+                remark_id,
+                patches,
+                snapshot,
+                response_id,
+            } => {
+                self.finish_request();
                 self.search_hits.clear();
                 self.selected_search_hit = None;
                 match self.doc.apply_patches(patches, Some(&snapshot)) {
                     Ok((applied, skipped)) => {
-                        let anchors: std::collections::HashSet<String> =
-                            applied.iter().cloned().collect();
-                        for r in self.remarks.remarks.iter_mut() {
-                            if anchors.contains(&r.anchor) {
-                                r.status = RemarkStatus::Applied;
-                            }
+                        let review_id = self
+                            .remarks
+                            .get(remark_id)
+                            .and_then(|remark| remark.source_review_id);
+                        if let Some(remark) = self.remarks.get_mut(remark_id) {
+                            remark.status = if applied.is_empty() {
+                                RemarkStatus::Failed
+                            } else {
+                                RemarkStatus::Applied
+                            };
                         }
-                        for r in self.remarks.remarks.iter_mut() {
-                            if skipped.contains(&r.anchor) {
-                                r.status = RemarkStatus::Failed;
-                            }
-                        }
-                        for item in self.review_store.items.iter_mut() {
-                            if item.status == crate::review::ReviewStatus::Sent {
-                                item.status = crate::review::ReviewStatus::Applied;
+                        if let Some(review_id) = review_id {
+                            if applied.is_empty() {
+                                self.review_store.mark_answered(review_id);
+                            } else {
+                                self.review_store.mark_applied(review_id);
                             }
                         }
                         let remaining = self.review_store.pending().len();
@@ -1603,92 +1664,154 @@ impl App {
                             Some(self.selected_review.unwrap_or(0).min(remaining - 1))
                         };
                         self.refresh_display();
+                        let session_warning = self
+                            .session_store
+                            .set_patch_previous_response_id(Some(response_id))
+                            .err()
+                            .map(|e| format!(" Session state was not saved: {}", e))
+                            .unwrap_or_default();
                         if let Err(e) = self.doc.save() {
-                            self.status_message = Some(format!("Autosave failed: {}", e));
+                            self.status_message =
+                                Some(format!("Autosave failed: {}{}", e, session_warning));
+                        } else if applied.is_empty() {
+                            self.status_message = Some(format!(
+                                "No patches applied for this remark; {} target(s) were stale.{}",
+                                skipped.len(),
+                                session_warning
+                            ));
                         } else if skipped.is_empty() {
                             self.status_message = Some(format!(
-                                "Applied {} patch(es) and saved.",
-                                applied.len()
+                                "Applied {} patch(es) and saved.{}",
+                                applied.len(),
+                                session_warning
                             ));
                         } else {
                             self.status_message = Some(format!(
-                                "Applied {} patch(es), skipped {} (document changed since request), and saved.",
+                                "Applied {} patch(es), skipped {} (document changed since request), and saved.{}",
                                 applied.len(),
-                                skipped.len()
+                                skipped.len(),
+                                session_warning
                             ));
+                        }
+
+                        if self.remarks.pending().len() > 0 {
+                            self.status_message = Some(format!(
+                                "{} Sending next queued remark…",
+                                self.status_message.as_deref().unwrap_or("Done.")
+                            ));
+                            self.send_next_remark().await;
                         }
                     }
                     Err(e) => {
+                        if let Some(remark) = self.remarks.get_mut(remark_id) {
+                            remark.status = RemarkStatus::Failed;
+                            if let Some(review_id) = remark.source_review_id {
+                                self.review_store.mark_answered(review_id);
+                            }
+                        }
                         self.status_message = Some(format!("Patch error: {}", e));
                     }
                 }
             }
-            AppEvent::ReviewReceived(items) => {
-                self.is_loading = false;
+            AppEvent::PatchFailed { remark_id, message } => {
+                self.finish_request();
+                if let Some(remark) = self.remarks.get_mut(remark_id) {
+                    remark.status = RemarkStatus::Failed;
+                    if let Some(review_id) = remark.source_review_id {
+                        self.review_store.mark_answered(review_id);
+                    }
+                }
+                self.status_message = Some(format!("Patch request failed: {}", message));
+            }
+            AppEvent::ReviewReceived { items, response_id } => {
+                self.finish_request();
                 self.clear_request_progress();
-                let should_open_review = self.open_review_when_ready && self.mode == AppMode::Normal;
+                let should_open_review =
+                    self.open_review_when_ready && self.mode == AppMode::Normal;
                 self.open_review_when_ready = false;
                 let n = items.len();
                 self.review_store.clear();
                 for item in items {
                     self.review_store.add(item);
                 }
+                let session_warning = self
+                    .session_store
+                    .set_analysis_previous_response_id(Some(response_id))
+                    .err()
+                    .map(|e| format!(" Session state was not saved: {}", e))
+                    .unwrap_or_default();
                 if n == 0 {
-                    self.status_message = Some("Analysis complete — no issues found.".to_string());
+                    self.status_message = Some(format!(
+                        "Analysis complete — no issues found.{}",
+                        session_warning
+                    ));
                 } else if should_open_review {
                     self.mode = AppMode::ReviewMode;
                     self.selected_review = Some(0);
                     self.status_message = Some(format!(
-                        "Review found {} issue(s). ↑/↓ navigate  a answer  y accept  d dismiss  x clear results",
-                        n
+                        "Review found {} issue(s). ↑/↓ navigate  a answer  y accept  d dismiss  x clear results{}",
+                        n,
+                        session_warning
                     ));
                 } else {
                     if self.selected_review.is_none() {
                         self.selected_review = Some(0);
                     }
                     self.status_message = Some(format!(
-                        "Analysis found {} issue(s). Press A to open review.",
-                        n
+                        "Analysis found {} issue(s). Press Shift+A to open review.{}",
+                        n, session_warning
                     ));
                 }
             }
-            AppEvent::DocumentCreated(content) => {
-                self.is_loading = false;
+            AppEvent::AnalysisFailed(message) => {
+                self.finish_request();
+                self.open_review_when_ready = false;
+                self.clear_request_progress();
+                self.status_message = Some(format!("Analysis failed: {}", message));
+            }
+            AppEvent::DocumentCreated {
+                content,
+                response_id,
+            } => {
+                self.finish_request();
                 self.clear_request_progress();
                 self.search_hits.clear();
                 self.selected_search_hit = None;
                 match self.doc.set_content(content) {
                     Ok(()) => match self.doc.save() {
                         Ok(()) => {
+                            let session_warning = self
+                                .session_store
+                                .set_patch_previous_response_id(Some(response_id))
+                                .err()
+                                .map(|e| format!(" Session state was not saved: {}", e))
+                                .unwrap_or_default();
                             self.input.clear();
                             self.refresh_display();
                             self.mode = AppMode::Normal;
                             self.status_message = Some(
-                                "Document created and saved! Use ↑/↓ to navigate, r to update matching occurrences."
-                                    .to_string(),
+                                format!(
+                                    "Document created and saved! Use ↑/↓ to navigate, r to add a remark.{}",
+                                    session_warning
+                                ),
                             );
                         }
                         Err(e) => {
-                            self.status_message =
-                                Some(format!("Created but save failed: {}", e));
+                            self.status_message = Some(format!("Created but save failed: {}", e));
                         }
                     },
                     Err(e) => {
-                        self.status_message =
-                            Some(format!("Failed to process document: {}", e));
+                        self.status_message = Some(format!("Failed to process document: {}", e));
                     }
                 }
             }
+            AppEvent::CreationFailed(message) => {
+                self.finish_request();
+                self.clear_request_progress();
+                self.status_message = Some(format!("Creation failed: {}", message));
+            }
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);
-            }
-            AppEvent::Loading(v) => {
-                self.is_loading = v;
-            }
-            AppEvent::RequestProgress(chars) => {
-                if let Some((_, current_chars)) = self.request_progress.as_mut() {
-                    *current_chars = chars;
-                }
             }
         }
     }

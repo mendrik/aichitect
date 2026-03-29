@@ -34,12 +34,6 @@ pub struct RevisionContextPack {
     pub list_context: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RevisionRequestMode {
-    Targeted,
-    FullDocument,
-}
-
 #[derive(Debug, Clone)]
 pub struct TargetedRevisionPlan {
     pub packs: Vec<RevisionContextPack>,
@@ -77,13 +71,12 @@ pub fn build_targeted_revision_plan(
         packs.push(pack);
     }
 
-    if total_targets > MAX_TARGETED_OCCURRENCES || total_context_chars > MAX_TARGETED_CONTEXT_CHARS {
+    if total_targets > MAX_TARGETED_OCCURRENCES || total_context_chars > MAX_TARGETED_CONTEXT_CHARS
+    {
         return None;
     }
 
-    Some(TargetedRevisionPlan {
-        packs,
-    })
+    Some(TargetedRevisionPlan { packs })
 }
 
 fn build_context_pack(doc: &Document, remark: &Remark) -> Option<RevisionContextPack> {
@@ -120,7 +113,10 @@ fn build_target(
             NodeKind::CodeBlock { code, .. } => code.lines().nth(line_idx)?.to_string(),
             _ => return None,
         },
-        None => doc.raw.get(doc.nodes[node_idx].source_start..doc.nodes[node_idx].source_end)?.to_string(),
+        None => doc
+            .raw
+            .get(doc.nodes[node_idx].source_start..doc.nodes[node_idx].source_end)?
+            .to_string(),
     };
 
     Some(ContextTarget {
@@ -142,7 +138,11 @@ fn resolve_anchor(doc: &Document, anchor: &str) -> Option<(usize, Option<usize>)
     }
 }
 
-fn collect_local_context_nodes(doc: &Document, node_idx: usize, selected_anchor: &str) -> Vec<ContextNode> {
+fn collect_local_context_nodes(
+    doc: &Document,
+    node_idx: usize,
+    selected_anchor: &str,
+) -> Vec<ContextNode> {
     let section_indices = section_context_indices(doc, node_idx);
     let mut seen = HashSet::new();
 
@@ -182,7 +182,10 @@ fn section_context_indices(doc: &Document, node_idx: usize) -> Vec<usize> {
         for idx in start..doc.nodes.len() {
             let node = &doc.nodes[idx];
             if idx > start {
-                if let NodeKind::Heading { level: next_level, .. } = node.kind {
+                if let NodeKind::Heading {
+                    level: next_level, ..
+                } = node.kind
+                {
                     if next_level <= level {
                         break;
                     }
@@ -205,12 +208,16 @@ fn summarize_node(node: &crate::document::DocNode) -> String {
     match &node.kind {
         NodeKind::Heading { text, .. } => format!("Heading({})", text),
         NodeKind::Paragraph { text } => format!("Paragraph({})", text),
-        NodeKind::CodeBlock { lang, .. } => format!("CodeBlock({})", lang.as_deref().unwrap_or("plain")),
+        NodeKind::CodeBlock { lang, .. } => {
+            format!("CodeBlock({})", lang.as_deref().unwrap_or("plain"))
+        }
         NodeKind::ListItem { text, .. } => format!("ListItem({})", text),
         NodeKind::BlockQuote { text } => format!("BlockQuote({})", text),
         NodeKind::HorizontalRule => "HorizontalRule".to_string(),
         NodeKind::Html { .. } => "Html".to_string(),
-        NodeKind::Table { headers, rows } => format!("Table({}col×{}row)", headers.len(), rows.len()),
+        NodeKind::Table { headers, rows } => {
+            format!("Table({}col×{}row)", headers.len(), rows.len())
+        }
     }
 }
 
@@ -232,7 +239,12 @@ mod tests {
             redo_stack: Vec::new(),
             generation: 0,
         };
-        doc.anchor_map = doc.nodes.iter().enumerate().map(|(i, n)| (n.anchor.clone(), i)).collect();
+        doc.anchor_map = doc
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.anchor.clone(), i))
+            .collect();
         doc
     }
 
@@ -244,6 +256,7 @@ mod tests {
         let second_anchor = doc.nodes[2].anchor.clone();
         let remark = Remark {
             id: Uuid::new_v4(),
+            source_review_id: None,
             anchor: para_anchor,
             selected_text: "alpha beta".to_string(),
             target_type: TargetType::Paragraph,
@@ -276,6 +289,7 @@ mod tests {
 
         let remark = Remark {
             id: Uuid::new_v4(),
+            source_review_id: None,
             anchor: primary_anchor,
             selected_text: "alpha".to_string(),
             target_type: TargetType::Paragraph,

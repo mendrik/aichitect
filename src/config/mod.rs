@@ -12,7 +12,9 @@ pub enum ColorMode {
 }
 
 impl Default for ColorMode {
-    fn default() -> Self { ColorMode::Auto }
+    fn default() -> Self {
+        ColorMode::Auto
+    }
 }
 
 /// Raw TOML shape — every tunable is `Option<T>` so we can distinguish
@@ -79,8 +81,7 @@ impl Config {
                 path.display()
             )
         })?;
-        let raw: RawConfig =
-            toml::from_str(&content).context("Failed to parse config.toml")?;
+        let raw: RawConfig = toml::from_str(&content).context("Failed to parse config.toml")?;
         if raw.api_key.is_empty() || raw.api_key.starts_with("sk-...") {
             anyhow::bail!(
                 "api_key is not set in config.toml. \
@@ -89,8 +90,8 @@ impl Config {
         }
         Ok(Config {
             api_key: raw.api_key,
-            model: raw.model.unwrap_or_else(|| "gpt-4o".to_string()),
-            model_fix: raw.model_fix.unwrap_or_else(|| "gpt-4o".to_string()),
+            model: raw.model.unwrap_or_else(|| "gpt-5.4".to_string()),
+            model_fix: raw.model_fix.unwrap_or_else(|| "gpt-5.4-mini".to_string()),
             base_url: raw.base_url,
             organization: raw.organization,
             project: raw.project,
@@ -116,8 +117,8 @@ impl Config {
 # lets the OpenAI API use its own defaults.
 
 api_key = "sk-..."
-model = "gpt-4o"
-model_fix = "gpt-4o-mini"
+model = "gpt-5.4"
+model_fix = "gpt-5.4-mini"
 
 # Optional — uncomment to override OpenAI defaults:
 # temperature = 0.3

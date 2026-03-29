@@ -1,6 +1,6 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 use super::app::{App, AppMode};
 use super::input::InputBuffer;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
     if matches!(key.code, KeyCode::Char('d')) && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -22,7 +22,9 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
         AppMode::ReviewMode => handle_review_mode(app, key).await,
         AppMode::ReviewAnswer => handle_input_mode(app, key, InputTarget::ReviewAnswer).await,
         AppMode::HistoryBrowser => handle_history_browser(app, key),
-        AppMode::Help => { app.mode = AppMode::Normal; }
+        AppMode::Help => {
+            app.mode = AppMode::Normal;
+        }
     }
 }
 
@@ -78,15 +80,33 @@ async fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_search(),
         KeyCode::Char('?') => app.mode = AppMode::Help,
-        KeyCode::Up => { app.clear_occurrences(); app.select_prev_node(); }
-        KeyCode::Down => { app.clear_occurrences(); app.select_next_node(); }
-        KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.collapse_headings_below(),
-        KeyCode::Left => {
-            if app.is_on_table() { app.table_prev_col(); } else { app.collapse_heading(); }
+        KeyCode::Up => {
+            app.clear_occurrences();
+            app.select_prev_node();
         }
-        KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.expand_headings_below(),
+        KeyCode::Down => {
+            app.clear_occurrences();
+            app.select_next_node();
+        }
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.collapse_headings_below()
+        }
+        KeyCode::Left => {
+            if app.is_on_table() {
+                app.table_prev_col();
+            } else {
+                app.collapse_heading();
+            }
+        }
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.expand_headings_below()
+        }
         KeyCode::Right => {
-            if app.is_on_table() { app.table_next_col(); } else { app.expand_heading(); }
+            if app.is_on_table() {
+                app.table_next_col();
+            } else {
+                app.expand_heading();
+            }
         }
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
@@ -97,7 +117,7 @@ async fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => app.activate_link(),
         KeyCode::Char('c') => app.toggle_collapse_all(),
         KeyCode::Char('e') => app.start_direct_edit(),
-        KeyCode::Char('r') => app.find_and_show_occurrences(),
+        KeyCode::Char('r') => app.start_remark(),
         KeyCode::Char('R') => {
             app.show_remarks_panel = !app.show_remarks_panel;
         }

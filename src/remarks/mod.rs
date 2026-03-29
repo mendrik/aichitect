@@ -1,7 +1,7 @@
+use crate::document::AnchorId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::document::AnchorId;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TargetType {
@@ -25,6 +25,8 @@ pub enum RemarkStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Remark {
     pub id: Uuid,
+    #[serde(default)]
+    pub source_review_id: Option<Uuid>,
     pub anchor: AnchorId,
     pub selected_text: String,
     pub target_type: TargetType,
@@ -44,23 +46,44 @@ pub struct RemarkStore {
 }
 
 impl RemarkStore {
-    pub fn new() -> Self { Self::default() }
-    pub fn add(&mut self, r: Remark) { self.remarks.push(r); }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn add(&mut self, r: Remark) {
+        self.remarks.push(r);
+    }
+    pub fn get(&self, id: Uuid) -> Option<&Remark> {
+        self.remarks.iter().find(|r| r.id == id)
+    }
+    pub fn get_mut(&mut self, id: Uuid) -> Option<&mut Remark> {
+        self.remarks.iter_mut().find(|r| r.id == id)
+    }
     #[allow(dead_code)]
-    pub fn remove(&mut self, id: Uuid) { self.remarks.retain(|r| r.id != id); }
+    pub fn remove(&mut self, id: Uuid) {
+        self.remarks.retain(|r| r.id != id);
+    }
     pub fn pending(&self) -> Vec<&Remark> {
-        self.remarks.iter().filter(|r| r.status == RemarkStatus::Pending).collect()
+        self.remarks
+            .iter()
+            .filter(|r| r.status == RemarkStatus::Pending)
+            .collect()
     }
     #[allow(dead_code)]
     pub fn mark_sent(&mut self, id: Uuid) {
-        if let Some(r) = self.remarks.iter_mut().find(|r| r.id == id) { r.status = RemarkStatus::Sent; }
+        if let Some(r) = self.remarks.iter_mut().find(|r| r.id == id) {
+            r.status = RemarkStatus::Sent;
+        }
     }
     #[allow(dead_code)]
     pub fn mark_applied(&mut self, id: Uuid) {
-        if let Some(r) = self.remarks.iter_mut().find(|r| r.id == id) { r.status = RemarkStatus::Applied; }
+        if let Some(r) = self.remarks.iter_mut().find(|r| r.id == id) {
+            r.status = RemarkStatus::Applied;
+        }
     }
     #[allow(dead_code)]
     pub fn mark_failed(&mut self, id: Uuid) {
-        if let Some(r) = self.remarks.iter_mut().find(|r| r.id == id) { r.status = RemarkStatus::Failed; }
+        if let Some(r) = self.remarks.iter_mut().find(|r| r.id == id) {
+            r.status = RemarkStatus::Failed;
+        }
     }
 }

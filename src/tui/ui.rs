@@ -1,17 +1,17 @@
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph,
-        Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
     },
+    Frame,
 };
 
 use super::app::{App, AppMode};
 use super::input::InputSpan;
-use crate::document::{SpanStyle, truncate_chars};
+use crate::document::{truncate_chars, SpanStyle};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
@@ -22,7 +22,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Full-screen creation prompt: skip the normal layout.
     if app.mode == AppMode::CreationPrompt {
         draw_creation_prompt(f, app, size);
-        draw_status_bar(f, app, Rect { y: size.height.saturating_sub(1), height: 1, ..size });
+        draw_status_bar(
+            f,
+            app,
+            Rect {
+                y: size.height.saturating_sub(1),
+                height: 1,
+                ..size
+            },
+        );
         if app.request_progress.is_some() {
             draw_request_overlay(f, app, size);
         }
@@ -88,25 +96,45 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn span_style_to_ratatui(style: &SpanStyle) -> Style {
     match style {
         SpanStyle::Normal => Style::default().fg(Color::White),
-        SpanStyle::Bold => Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        SpanStyle::Italic => Style::default().fg(Color::White).add_modifier(Modifier::ITALIC),
+        SpanStyle::Bold => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        SpanStyle::Italic => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::ITALIC),
         SpanStyle::Code => Style::default().fg(Color::Yellow),
-        SpanStyle::Heading(1) => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        SpanStyle::Heading(2) => Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
-        SpanStyle::Heading(_) => Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        SpanStyle::Heading(1) => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        SpanStyle::Heading(2) => Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+        SpanStyle::Heading(_) => Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
         SpanStyle::CodeBlockLine => Style::default().fg(Color::Yellow),
-        SpanStyle::BlockQuote => Style::default().fg(Color::LightMagenta).add_modifier(Modifier::ITALIC),
+        SpanStyle::BlockQuote => Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::ITALIC),
         SpanStyle::Dimmed => Style::default().fg(Color::DarkGray),
         SpanStyle::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        SpanStyle::TableHeader => Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        SpanStyle::TableHeader => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
         SpanStyle::TableBorder => Style::default().fg(Color::DarkGray),
-        SpanStyle::Keyword => Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+        SpanStyle::Keyword => Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
         SpanStyle::StringLit => Style::default().fg(Color::LightGreen),
-        SpanStyle::Comment => Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        SpanStyle::Comment => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
         SpanStyle::Number => Style::default().fg(Color::LightYellow),
         SpanStyle::Operator => Style::default().fg(Color::Gray),
         SpanStyle::Bracket => Style::default().fg(Color::LightMagenta),
-        SpanStyle::Link(_) => Style::default().fg(Color::LightBlue).add_modifier(Modifier::UNDERLINED),
+        SpanStyle::Link(_) => Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::UNDERLINED),
     }
 }
 
@@ -123,7 +151,10 @@ fn shows_bottom_progress(app: &App) -> bool {
 }
 
 fn draw_document(f: &mut Frame, app: &App, area: Rect) {
-    let fname = app.doc.path.file_name()
+    let fname = app
+        .doc
+        .path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("document.md");
     let loading = if app.is_loading {
@@ -147,73 +178,65 @@ fn draw_document(f: &mut Frame, app: &App, area: Rect) {
     let visible_height = inner.height as usize;
     let scroll = app.scroll_offset;
 
-    let occurrence_set: std::collections::HashSet<&str> = app
-        .occurrence_hits
-        .iter()
-        .map(|(hit, _)| hit.as_str())
-        .collect();
     let search_set: std::collections::HashSet<&str> = app
         .search_hits
         .iter()
         .map(|(hit, _)| hit.as_str())
         .collect();
 
-    let lines: Vec<Line> = app.display_lines
+    let lines: Vec<Line> = app
+        .display_lines
         .iter()
         .skip(scroll)
         .take(visible_height)
         .map(|sl| {
             let is_selected = match (sl.node_index, app.selected_node) {
-                (Some(ni), Some(sel)) if ni == sel => {
-                    match app.selected_line_in_node {
-                        Some(sel_line) => sl.line_in_block == Some(sel_line),
-                        None => true,
-                    }
-                }
+                (Some(ni), Some(sel)) if ni == sel => match app.selected_line_in_node {
+                    Some(sel_line) => sl.line_in_block == Some(sel_line),
+                    None => true,
+                },
                 _ => false,
             };
-            let is_occurrence = sl.anchor.as_deref().map(|a| {
-                occurrence_set.contains(a)
-            }).unwrap_or(false)
-            || sl.node_index.and_then(|ni| {
-                sl.line_in_block.map(|li| {
-                    let node_anchor = &app.doc.nodes[ni].anchor;
-                    let line_anchor = format!("{}:L{}", node_anchor, li);
-                    occurrence_set.contains(line_anchor.as_str())
-                })
-            }).unwrap_or(false);
-            let is_search_hit = sl.anchor.as_deref().map(|a| {
-                search_set.contains(a)
-            }).unwrap_or(false)
-            || sl.node_index.and_then(|ni| {
-                sl.line_in_block.map(|li| {
-                    let node_anchor = &app.doc.nodes[ni].anchor;
-                    let line_anchor = format!("{}:L{}", node_anchor, li);
-                    search_set.contains(line_anchor.as_str())
-                })
-            }).unwrap_or(false);
+            let is_search_hit = sl
+                .anchor
+                .as_deref()
+                .map(|a| search_set.contains(a))
+                .unwrap_or(false)
+                || sl
+                    .node_index
+                    .and_then(|ni| {
+                        sl.line_in_block.map(|li| {
+                            let node_anchor = &app.doc.nodes[ni].anchor;
+                            let line_anchor = format!("{}:L{}", node_anchor, li);
+                            search_set.contains(line_anchor.as_str())
+                        })
+                    })
+                    .unwrap_or(false);
 
             if sl.spans.is_empty() {
                 Line::from("")
             } else {
                 let selected_col = app.selected_table_col;
-                let spans: Vec<Span> = sl.spans.iter().map(|s| {
-                    let mut style = span_style_to_ratatui(&s.style);
-                    // For table rows, only highlight the selected cell span (or all if no column selected).
-                    let apply_sel = is_selected && match (s.cell_col, selected_col) {
-                        (Some(sc), Some(tc)) => sc == tc,
-                        (None, Some(_)) => false,
-                        _ => true,
-                    };
-                    if apply_sel {
-                        style = style.bg(Color::DarkGray);
-                    } else if is_occurrence {
-                        style = style.bg(Color::Yellow).fg(Color::Black);
-                    } else if is_search_hit {
-                        style = style.bg(Color::Cyan).fg(Color::Black);
-                    }
-                    Span::styled(s.text.clone(), style)
-                }).collect();
+                let spans: Vec<Span> = sl
+                    .spans
+                    .iter()
+                    .map(|s| {
+                        let mut style = span_style_to_ratatui(&s.style);
+                        // For table rows, only highlight the selected cell span (or all if no column selected).
+                        let apply_sel = is_selected
+                            && match (s.cell_col, selected_col) {
+                                (Some(sc), Some(tc)) => sc == tc,
+                                (None, Some(_)) => false,
+                                _ => true,
+                            };
+                        if apply_sel {
+                            style = style.bg(Color::DarkGray);
+                        } else if is_search_hit {
+                            style = style.bg(Color::Cyan).fg(Color::Black);
+                        }
+                        Span::styled(s.text.clone(), style)
+                    })
+                    .collect();
                 Line::from(spans)
             }
         })
@@ -246,41 +269,56 @@ fn draw_remarks_panel(f: &mut Frame, app: &App, area: Rect) {
 
     if app.remarks.remarks.is_empty() {
         f.render_widget(
-            Paragraph::new("No remarks yet.\nSelect a node and press r.")
+            Paragraph::new("No remarks yet.\nSelect a node and press r to add one.")
                 .style(Style::default().fg(Color::DarkGray)),
             inner,
         );
         return;
     }
 
-    let items: Vec<ListItem> = app.remarks.remarks.iter().map(|r| {
-        let (icon, color) = match r.status {
-            crate::remarks::RemarkStatus::Draft => ("○", Color::Gray),
-            crate::remarks::RemarkStatus::Pending => ("◉", Color::Yellow),
-            crate::remarks::RemarkStatus::Sent => ("⟳", Color::Cyan),
-            crate::remarks::RemarkStatus::Applied => ("✓", Color::Green),
-            crate::remarks::RemarkStatus::Failed => ("✗", Color::Red),
-        };
-        let anchor = if r.anchor.len() > 15 { &r.anchor[..15] } else { &r.anchor };
-        let text = if r.text.chars().count() > 28 {
-            format!("{}…", truncate_chars(&r.text, 28))
-        } else {
-            r.text.clone()
-        };
-        ListItem::new(Line::from(vec![
-            Span::styled(format!("{} ", icon), Style::default().fg(color)),
-            Span::styled(format!("[{}] ", anchor), Style::default().fg(Color::DarkGray)),
-            Span::styled(text, Style::default().fg(Color::White)),
-        ]))
-    }).collect();
+    let items: Vec<ListItem> = app
+        .remarks
+        .remarks
+        .iter()
+        .map(|r| {
+            let (icon, color) = match r.status {
+                crate::remarks::RemarkStatus::Draft => ("○", Color::Gray),
+                crate::remarks::RemarkStatus::Pending => ("◉", Color::Yellow),
+                crate::remarks::RemarkStatus::Sent => ("⟳", Color::Cyan),
+                crate::remarks::RemarkStatus::Applied => ("✓", Color::Green),
+                crate::remarks::RemarkStatus::Failed => ("✗", Color::Red),
+            };
+            let anchor = if r.anchor.len() > 15 {
+                &r.anchor[..15]
+            } else {
+                &r.anchor
+            };
+            let text = if r.text.chars().count() > 28 {
+                format!("{}…", truncate_chars(&r.text, 28))
+            } else {
+                r.text.clone()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{} ", icon), Style::default().fg(color)),
+                Span::styled(
+                    format!("[{}] ", anchor),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(text, Style::default().fg(Color::White)),
+            ]))
+        })
+        .collect();
 
     let total = items.len();
     let mut state = ListState::default();
     state.select(app.selected_remark);
     *state.offset_mut() = app.side_scroll;
 
-    let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
     f.render_stateful_widget(list, inner, &mut state);
 
     if total > inner.height as usize {
@@ -311,7 +349,8 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         AppMode::Help => "HELP",
     };
     let msg = app.status_message.as_deref().unwrap_or("");
-    let node_info = app.selected_node
+    let node_info = app
+        .selected_node
         .and_then(|i| app.doc.nodes.get(i))
         .map(|n| format!(" [{}]", n.anchor))
         .unwrap_or_default();
@@ -320,9 +359,15 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     let left = Span::styled(
         format!(" {} ", mode_str),
-        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     );
-    let mid = Span::styled(format!(" {}{} ", msg, node_info), Style::default().fg(Color::White));
+    let mid = Span::styled(
+        format!(" {}{} ", msg, node_info),
+        Style::default().fg(Color::White),
+    );
     let right = Span::styled(
         format!(" {}r {}p ", total, pending_count),
         Style::default().fg(Color::DarkGray),
@@ -336,21 +381,36 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_creation_prompt(f: &mut Frame, app: &App, area: Rect) {
     // Leave room for the status bar at the bottom.
-    let content_area = Rect { height: area.height.saturating_sub(1), ..area };
+    let content_area = Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(3), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
         .split(content_area);
 
     // Header block
-    let fname = app.doc.path.file_name()
+    let fname = app
+        .doc
+        .path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("new-document.md");
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("New document: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(fname, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                fname,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -358,14 +418,22 @@ fn draw_creation_prompt(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )]),
     ])
-    .block(Block::default().borders(Borders::ALL).title(" Aichitect — Create ")
-        .border_style(Style::default().fg(Color::Cyan)));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Aichitect — Create ")
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
     f.render_widget(header, chunks[0]);
 
     // Input area
     let loading = app.is_loading;
     let border_color = if loading { Color::Yellow } else { Color::White };
-    let title = if loading { " Generating… " } else { " Your prompt (Enter to create  Alt+Enter for newline) " };
+    let title = if loading {
+        " Generating… "
+    } else {
+        " Your prompt (Enter to create  Alt+Enter for newline) "
+    };
 
     let input_block = Block::default()
         .borders(Borders::ALL)
@@ -400,7 +468,8 @@ fn draw_remark_editor(f: &mut Frame, app: &App, size: Rect) {
     let area = centered_rect(64, 35, size);
     f.render_widget(Clear, area);
 
-    let node_info = app.selected_node
+    let node_info = app
+        .selected_node
         .and_then(|i| app.doc.nodes.get(i))
         .map(|n| n.anchor.clone())
         .unwrap_or_default();
@@ -477,7 +546,11 @@ fn draw_search_popup(f: &mut Frame, app: &App, size: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     let input_block = Block::default()
@@ -506,7 +579,10 @@ fn draw_search_popup(f: &mut Frame, app: &App, size: Rect) {
             Style::default().fg(Color::DarkGray),
         )])
     } else {
-        let selected = app.selected_search_hit.unwrap_or(0).min(app.search_hits.len() - 1);
+        let selected = app
+            .selected_search_hit
+            .unwrap_or(0)
+            .min(app.search_hits.len() - 1);
         let snippet = &app.search_hits[selected].1;
         let snippet = if snippet.chars().count() > 60 {
             format!("{}…", truncate_chars(snippet, 60))
@@ -516,7 +592,9 @@ fn draw_search_popup(f: &mut Frame, app: &App, size: Rect) {
         Line::from(vec![
             Span::styled(
                 format!("Match {}/{} ", selected + 1, app.search_hits.len()),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(snippet, Style::default().fg(Color::DarkGray)),
         ])
@@ -547,7 +625,7 @@ fn draw_review_panel(f: &mut Frame, app: &App, size: Rect) {
 
     if pending.is_empty() {
         let msg = if app.review_store.items.is_empty() {
-            "No review items. Press A to analyze."
+            "No review items. Press Shift+A to analyze."
         } else {
             "All items addressed. Press x to clear cached results or q to exit."
         };
@@ -564,23 +642,41 @@ fn draw_review_panel(f: &mut Frame, app: &App, size: Rect) {
         .split(inner);
 
     // Left: item list
-    let items: Vec<ListItem> = pending.iter().map(|item| {
-        let color = match item.status {
-            crate::review::ReviewStatus::Answered => Color::Green,
-            _ => Color::Yellow,
-        };
-        let anchor = if item.anchor.len() > 12 { &item.anchor[..12] } else { &item.anchor };
-        ListItem::new(Line::from(vec![
-            Span::styled(format!("[{}] ", anchor), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}", item.category), Style::default().fg(color)),
-        ]))
-    }).collect();
+    let items: Vec<ListItem> = pending
+        .iter()
+        .map(|item| {
+            let color = match item.status {
+                crate::review::ReviewStatus::Answered => Color::Green,
+                _ => Color::Yellow,
+            };
+            let anchor = if item.anchor.len() > 12 {
+                &item.anchor[..12]
+            } else {
+                &item.anchor
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", anchor),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(format!("{}", item.category), Style::default().fg(color)),
+            ]))
+        })
+        .collect();
 
     let mut list_state = ListState::default();
     list_state.select(app.selected_review);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(Color::DarkGray)))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_stateful_widget(list, chunks[0], &mut list_state);
 
     // Right: detail + answer input
@@ -620,8 +716,10 @@ fn draw_review_panel(f: &mut Frame, app: &App, size: Rect) {
                 );
             } else {
                 f.render_widget(
-                    Paragraph::new("a answer  y accept resolution  d dismiss  x clear results  q exit")
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Paragraph::new(
+                        "a answer  y accept resolution  d dismiss  x clear results  q exit",
+                    )
+                    .style(Style::default().fg(Color::DarkGray)),
                     right_chunks[1],
                 );
             }
@@ -650,24 +748,40 @@ fn draw_request_progress_bar(f: &mut Frame, app: &App, area: Rect) {
     )];
 
     if bar_width > 0 {
-        const PALETTE: &[Color] = &[Color::DarkGray, Color::Gray, Color::White, Color::Cyan, Color::LightCyan];
+        const PALETTE: &[Color] = &[
+            Color::DarkGray,
+            Color::Gray,
+            Color::White,
+            Color::Cyan,
+            Color::LightCyan,
+        ];
         let segment_width = (bar_width / 4).max(3).min(bar_width);
         let travel = bar_width + segment_width;
         let offset = (app.spinner_tick / 2) as usize % travel;
 
-        spans.push(Span::styled("[", Style::default().fg(Color::DarkGray).bg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "[",
+            Style::default().fg(Color::DarkGray).bg(Color::DarkGray),
+        ));
         for i in 0..bar_width {
             let active_start = offset.saturating_sub(segment_width);
             let is_active = i >= active_start && i < offset.min(bar_width + segment_width);
             let color = if is_active {
-                let gradient_idx = ((i + segment_width - active_start) * PALETTE.len()) / (segment_width + 1);
+                let gradient_idx =
+                    ((i + segment_width - active_start) * PALETTE.len()) / (segment_width + 1);
                 PALETTE[gradient_idx.min(PALETTE.len() - 1)]
             } else {
                 Color::Black
             };
-            spans.push(Span::styled("━", Style::default().fg(color).bg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "━",
+                Style::default().fg(color).bg(Color::DarkGray),
+            ));
         }
-        spans.push(Span::styled("]", Style::default().fg(Color::DarkGray).bg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "]",
+            Style::default().fg(Color::DarkGray).bg(Color::DarkGray),
+        ));
     }
 
     f.render_widget(
@@ -690,23 +804,39 @@ fn draw_request_overlay(f: &mut Frame, app: &App, size: Rect) {
     f.render_widget(block, area);
 
     const PALETTE: &[Color] = &[
-        Color::DarkGray, Color::Gray, Color::White,
-        Color::Cyan, Color::LightCyan, Color::White,
-        Color::Gray, Color::DarkGray,
+        Color::DarkGray,
+        Color::Gray,
+        Color::White,
+        Color::Cyan,
+        Color::LightCyan,
+        Color::White,
+        Color::Gray,
+        Color::DarkGray,
     ];
 
     let tick = (app.spinner_tick / 2) as usize;
-    let gradient_spans: Vec<Span> = label.chars().enumerate().map(|(i, ch)| {
-        let color = PALETTE[(tick + i) % PALETTE.len()];
-        Span::styled(ch.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD))
-    }).collect();
+    let gradient_spans: Vec<Span> = label
+        .chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let color = PALETTE[(tick + i) % PALETTE.len()];
+            Span::styled(
+                ch.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect();
 
     let approx_tokens = chars / 4;
     let spinner = spinner_frame(app.spinner_tick);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     f.render_widget(
@@ -720,7 +850,8 @@ fn draw_request_overlay(f: &mut Frame, app: &App, size: Rect) {
                 format!("~{} tokens received", approx_tokens),
                 Style::default().fg(Color::DarkGray),
             ),
-        ])).alignment(ratatui::layout::Alignment::Center),
+        ]))
+        .alignment(ratatui::layout::Alignment::Center),
         chunks[2],
     );
 }
@@ -739,7 +870,10 @@ fn draw_help(f: &mut Frame, size: Rect) {
     f.render_widget(block, area);
 
     let bold = |s: &str, c: Color| {
-        Line::from(vec![Span::styled(s.to_string(), Style::default().fg(c).add_modifier(Modifier::BOLD))])
+        Line::from(vec![Span::styled(
+            s.to_string(),
+            Style::default().fg(c).add_modifier(Modifier::BOLD),
+        )])
     };
 
     let help = vec![
@@ -754,7 +888,7 @@ fn draw_help(f: &mut Frame, size: Rect) {
         Line::from("  Ctrl+F        Search document"),
         Line::from(""),
         bold("Remarks", Color::Yellow),
-        Line::from("  r             Find all occurrences + write remark (updates all)"),
+        Line::from("  r             Add a remark for the current selection"),
         Line::from("  R             Toggle remarks panel"),
         Line::from("  H             Open revision history"),
         Line::from(""),
@@ -766,7 +900,7 @@ fn draw_help(f: &mut Frame, size: Rect) {
         Line::from("  Paste         Auto-collapsed if ≥ 3 lines"),
         Line::from(""),
         bold("Review", Color::Magenta),
-        Line::from("  A             Analyze document for issues"),
+        Line::from("  Shift+A       Analyze document for issues"),
         Line::from("  ↑↓            Navigate items"),
         Line::from("  a             Answer the issue"),
         Line::from("  d             Dismiss item"),
@@ -779,7 +913,10 @@ fn draw_help(f: &mut Frame, size: Rect) {
         Line::from("  Scroll        Scroll the pane under cursor"),
         Line::from("  Click         Select node in doc pane"),
         Line::from(""),
-        Line::from(vec![Span::styled("Press any key to close", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::styled(
+            "Press any key to close",
+            Style::default().fg(Color::DarkGray),
+        )]),
     ];
 
     f.render_widget(
@@ -803,27 +940,39 @@ pub fn input_spans_to_lines(spans: &[InputSpan]) -> Vec<Line<'static>> {
                 let mut parts = t.split('\n');
                 if let Some(first) = parts.next() {
                     if !first.is_empty() {
-                        lines.last_mut().unwrap().spans.push(Span::raw(first.to_string()));
+                        lines
+                            .last_mut()
+                            .unwrap()
+                            .spans
+                            .push(Span::raw(first.to_string()));
                     }
                 }
                 for part in parts {
                     lines.push(Line::from(vec![]));
                     if !part.is_empty() {
-                        lines.last_mut().unwrap().spans.push(Span::raw(part.to_string()));
+                        lines
+                            .last_mut()
+                            .unwrap()
+                            .spans
+                            .push(Span::raw(part.to_string()));
                     }
                 }
             }
             InputSpan::CollapsedPaste { lines: n, chars } => {
                 lines.last_mut().unwrap().spans.push(Span::styled(
                     format!("[pasted text … {} lines / {} chars]", n, chars),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
                 ));
             }
             InputSpan::Cursor => {
                 // Show cursor as a blinking-style thin block.
                 lines.last_mut().unwrap().spans.push(Span::styled(
                     "▌",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::RAPID_BLINK),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::RAPID_BLINK),
                 ));
             }
         }
@@ -853,14 +1002,20 @@ fn draw_history_browser(f: &mut Frame, app: &App, size: Rect) {
     let items: Vec<ListItem> = if app.history_entries.is_empty() {
         vec![ListItem::new("  No snapshots yet")]
     } else {
-        app.history_entries.iter().enumerate().map(|(i, e)| {
-            let style = if i == app.selected_history {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            ListItem::new(format!("  {}", e.label)).style(style)
-        }).collect()
+        app.history_entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let style = if i == app.selected_history {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(format!("  {}", e.label)).style(style)
+            })
+            .collect()
     };
 
     let mut list_state = ListState::default();
@@ -869,12 +1024,17 @@ fn draw_history_browser(f: &mut Frame, app: &App, size: Rect) {
     }
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(Color::DarkGray)))
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
         .highlight_style(Style::default().bg(Color::DarkGray));
     f.render_stateful_widget(list, chunks[0], &mut list_state);
 
     // ── Right: preview ────────────────────────────────────────────────────────
-    let preview_lines: Vec<Line> = app.history_preview
+    let preview_lines: Vec<Line> = app
+        .history_preview
         .lines()
         .skip(app.history_scroll)
         .take(chunks[1].height as usize)

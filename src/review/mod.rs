@@ -1,6 +1,6 @@
+use crate::document::AnchorId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::document::AnchorId;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -78,11 +78,20 @@ pub struct ReviewStore {
 }
 
 impl ReviewStore {
-    pub fn new() -> Self { Self::default() }
-    pub fn add(&mut self, item: ReviewItem) { self.items.push(item); }
-    pub fn is_empty(&self) -> bool { self.items.is_empty() }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn add(&mut self, item: ReviewItem) {
+        self.items.push(item);
+    }
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
     pub fn pending(&self) -> Vec<&ReviewItem> {
-        self.items.iter().filter(|i| i.status == ReviewStatus::New || i.status == ReviewStatus::Answered).collect()
+        self.items
+            .iter()
+            .filter(|i| i.status == ReviewStatus::New || i.status == ReviewStatus::Answered)
+            .collect()
     }
     #[allow(dead_code)]
     pub fn answer(&mut self, id: Uuid, answer: String) {
@@ -96,9 +105,27 @@ impl ReviewStore {
             item.status = ReviewStatus::Dismissed;
         }
     }
+    pub fn mark_pending(&mut self, id: Uuid, answer: String) {
+        if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
+            item.user_answer = Some(answer);
+            item.status = ReviewStatus::Pending;
+        }
+    }
     pub fn mark_sent(&mut self, ids: &[Uuid]) {
         for item in self.items.iter_mut() {
-            if ids.contains(&item.id) { item.status = ReviewStatus::Sent; }
+            if ids.contains(&item.id) {
+                item.status = ReviewStatus::Sent;
+            }
+        }
+    }
+    pub fn mark_answered(&mut self, id: Uuid) {
+        if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
+            item.status = ReviewStatus::Answered;
+        }
+    }
+    pub fn mark_applied(&mut self, id: Uuid) {
+        if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
+            item.status = ReviewStatus::Applied;
         }
     }
     pub fn clear(&mut self) {
